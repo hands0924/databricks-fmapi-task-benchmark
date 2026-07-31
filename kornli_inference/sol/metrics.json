@@ -1,0 +1,16 @@
+{
+  "model": "GPT-5.6-sol",
+  "endpoint": "databricks-gpt-5-6-sol",
+  "task": "kornli_inference",
+  "quality": {
+    "metric": "accuracy",
+    "direction": "higher",
+    "score": 0.6265,
+    "valid_submission": true
+  },
+  "time_seconds": 503.6,
+  "llm_cost_usd_per_run": null,
+  "cost_note": "per-run LLM $ not separable in v1 (concurrent runs; OpenAI-compat route logs no tokens). See COST.md. Model total across all runs: $5.17.",
+  "run_arch": "aarch64",
+  "run_id": "M2_t10_kornli_full_20260731_010755"
+}

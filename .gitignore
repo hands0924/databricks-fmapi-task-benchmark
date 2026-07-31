@@ -1,0 +1,7 @@
+# never commit secrets, hidden answer keys, or raw source data
+*.env
+.secrets/
+private/
+answers*.csv
+__pycache__/
+.DS_Store

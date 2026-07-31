@@ -1,0 +1,16 @@
+{
+  "model": "GPT-5.6-sol",
+  "endpoint": "databricks-gpt-5-6-sol",
+  "task": "pubg_placement_prediction",
+  "quality": {
+    "metric": "MAE",
+    "direction": "lower",
+    "score": 0.023339,
+    "valid_submission": true
+  },
+  "time_seconds": 1832.4,
+  "llm_cost_usd_per_run": null,
+  "cost_note": "per-run LLM $ not separable in v1 (concurrent runs; OpenAI-compat route logs no tokens). See COST.md. Model total across all runs: $5.17.",
+  "run_arch": "aarch64",
+  "run_id": "M2_t1_pubg_full_20260730_143413"
+}

@@ -1,0 +1,16 @@
+{
+  "model": "GLM 5.2",
+  "endpoint": "databricks-glm-5-2",
+  "task": "beep_hate_speech",
+  "quality": {
+    "metric": "macro-F1",
+    "direction": "higher",
+    "score": 0.55988,
+    "valid_submission": true
+  },
+  "time_seconds": 4180.3,
+  "llm_cost_usd_per_run": null,
+  "cost_note": "per-run LLM $ not separable in v1 (concurrent runs; OpenAI-compat route logs no tokens). See COST.md. Model total across all runs: $3.10.",
+  "run_arch": "aarch64",
+  "run_id": "M3_t8_beep_full_20260731_010758"
+}

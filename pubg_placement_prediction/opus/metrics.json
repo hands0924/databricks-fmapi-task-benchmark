@@ -1,0 +1,16 @@
+{
+  "model": "Claude Opus 5",
+  "endpoint": "databricks-claude-opus-5",
+  "task": "pubg_placement_prediction",
+  "quality": {
+    "metric": "MAE",
+    "direction": "lower",
+    "score": 0.023146,
+    "valid_submission": true
+  },
+  "time_seconds": 4159.1,
+  "llm_cost_usd_per_run": null,
+  "cost_note": "per-run LLM $ not separable in v1 (concurrent runs; OpenAI-compat route logs no tokens). See COST.md. Model total across all runs: $23.22.",
+  "run_arch": "aarch64",
+  "run_id": "M1_t1_pubg_full_20260730_143405"
+}

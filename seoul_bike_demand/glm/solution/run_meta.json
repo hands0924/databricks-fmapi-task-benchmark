@@ -1,0 +1,18 @@
+{
+  "val_rmse_gbm_autumn": 206.78018077543317,
+  "val_rmse_gbm_summer": 180.1451583709466,
+  "val_rmse_agg_hsw": 287.5694270755468,
+  "val_rmse_agg_autumn": 287.5694270755468,
+  "val_rmse_blend": 206.78018077543317,
+  "blend_w_gbm": 1.0,
+  "best_iteration": 419,
+  "n_features": 65,
+  "n_train": 7008,
+  "n_test": 1752,
+  "seeds": [
+    42,
+    7,
+    123,
+    2024
+  ]
+}

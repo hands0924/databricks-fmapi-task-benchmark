@@ -1,0 +1,16 @@
+{
+  "model": "GLM 5.2",
+  "endpoint": "databricks-glm-5-2",
+  "task": "pubg_placement_prediction",
+  "quality": {
+    "metric": "MAE",
+    "direction": "lower",
+    "score": 0.059101,
+    "valid_submission": true
+  },
+  "time_seconds": 2146.1,
+  "llm_cost_usd_per_run": null,
+  "cost_note": "per-run LLM $ not separable in v1 (concurrent runs; OpenAI-compat route logs no tokens). See COST.md. Model total across all runs: $3.10.",
+  "run_arch": "aarch64",
+  "run_id": "M3_t1_pubg_full_20260730_143420"
+}

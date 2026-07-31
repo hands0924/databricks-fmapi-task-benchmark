@@ -1,0 +1,16 @@
+{
+  "model": "GPT-5.6-sol",
+  "endpoint": "databricks-gpt-5-6-sol",
+  "task": "nsmc_movie_sentiment",
+  "quality": {
+    "metric": "accuracy",
+    "direction": "higher",
+    "score": 0.875796,
+    "valid_submission": true
+  },
+  "time_seconds": 552.4,
+  "llm_cost_usd_per_run": null,
+  "cost_note": "per-run LLM $ not separable in v1 (concurrent runs; OpenAI-compat route logs no tokens). See COST.md. Model total across all runs: $5.17.",
+  "run_arch": "aarch64",
+  "run_id": "M2_t4_nsmc_full_20260730_143416"
+}

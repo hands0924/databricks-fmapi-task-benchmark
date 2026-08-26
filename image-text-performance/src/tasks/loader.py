@@ -33,7 +33,7 @@ def discover_tasks() -> dict[str, type[base.Task]]:
             continue
         try:
             importlib.import_module(f"src.tasks.{name}")
-        except Exception as e:  # noqa: BLE001 — skip modules with varied import failures
+        except Exception as e:  # skip modules with varied import failures
             error = f"{type(e).__name__}: {e}"
             IMPORT_ERRORS[name] = error
             print(f"  [태스크 로드 스킵] {name}: {error}", file=sys.stderr)

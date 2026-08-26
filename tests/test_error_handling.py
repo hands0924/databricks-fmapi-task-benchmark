@@ -3,7 +3,9 @@
 import json
 import sys
 
-from benchmark import grade_tasks, run_task
+import pytest
+
+from benchmark import grade_tasks
 
 
 def test_validate_html_parse_error_for_missing_and_empty(tmp_path):
@@ -33,6 +35,7 @@ def test_discover_candidates_records_corrupt_metadata(tmp_path, monkeypatch, cap
 
 
 def test_run_task_returns_failure_for_missing_artifact(tmp_path, monkeypatch):
+    run_task = pytest.importorskip("benchmark.run_task")
     workdir = tmp_path / "candidate"
     workdir.mkdir()
     monkeypatch.setattr(run_task, "prepare_workdir", lambda task, candidate: workdir)

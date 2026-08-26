@@ -251,7 +251,7 @@ def run_direct_fmapi(task, candidate, harness, model, workdir, max_seconds) -> d
             meta["note"] = ("completion hit max_tokens (finish_reason=length) — "
                             "slides.html may be truncated")
             print(f"[run_task] WARNING: {meta['note']}")
-    except Exception as e:  # noqa: BLE001 — record any failure, never crash the run
+    except Exception as e:  # record any failure without crashing the run
         meta["note"] = f"FMAPI call failed ({type(e).__name__}: {e})"
         print(f"[run_task] ERROR: {meta['note']}")
     finally:

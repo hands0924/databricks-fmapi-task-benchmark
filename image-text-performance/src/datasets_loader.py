@@ -22,7 +22,7 @@ def load_registry(path: str | Path = "datasets/registry.yaml") -> dict[str, Any]
     with open(path, encoding="utf-8") as f:
         registry = yaml.safe_load(f)
     if not isinstance(registry, dict):
-        raise ValueError(f"registry 파일이 dict가 아님: {path}")  # noqa: TRY004
+        raise ValueError(f"registry 파일이 dict가 아님: {path}")
     return registry
 
 
@@ -76,7 +76,7 @@ def load_hf_split(
     # 2) 폴백: 일반 로드 (작은 데이터셋·mirror parquet). 캐시는 .cache/hf.
     try:
         ds = load_dataset(hf_id, name=config, split=split, cache_dir=_hf_cache_dir())
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # preserve both streaming and fallback errors
         streaming_detail = (
             f"{type(streaming_err).__name__}: {streaming_err}"
             if streaming_err
@@ -117,7 +117,7 @@ def get_label_names(hf_id: str, split: str, config: str | None, column: str) -> 
         if hasattr(cur, "feature"):
             cur = cur.feature
         return list(getattr(cur, "names", []) or []) or None
-    except Exception as e:  # noqa: BLE001 — datasets backends raise varied exceptions
+    except Exception as e:  # dataset backends raise varied exceptions
         print(
             f"[데이터셋] 라벨 이름 조회 실패: {hf_id} ({column}) "
             f"({type(e).__name__}: {e})",

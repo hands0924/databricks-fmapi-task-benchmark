@@ -76,7 +76,7 @@ class Img4Task(Task):
                     "source": "nsfw",
                     "source_idx": idx
                 })
-        except Exception as e:  # noqa: BLE001 — report source-specific loading failures
+        except Exception as e:  # report source-specific loading failures
             first_error = e
             errors.append(f"NSFW {type(e).__name__}: {e}")
             print(
@@ -108,7 +108,7 @@ class Img4Task(Task):
                     "source": "coco",
                     "source_idx": idx
                 })
-        except Exception as e:  # noqa: BLE001 — report source-specific loading failures
+        except Exception as e:  # report source-specific loading failures
             if first_error is None:
                 first_error = e
             errors.append(f"SFW {type(e).__name__}: {e}")

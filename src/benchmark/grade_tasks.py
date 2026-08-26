@@ -69,7 +69,7 @@ def discover_candidates(task: str, filter_names: list[str] | None) -> list[dict]
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as e:
                 print(
-                    f"WARNING: {meta_path}를 읽을 수 없음 "
+                    f"WARNING: cannot read run metadata {meta_path} "
                     f"({type(e).__name__}: {e})",
                     file=sys.stderr,
                 )
@@ -97,7 +97,7 @@ def validate_html(html_path: Path, cfg: dict) -> dict:
     out["has_doctype"] = raw.lstrip().lower().startswith("<!doctype")
     try:
         doc = lxml_html.fromstring(raw)
-    except Exception as e:  # noqa: BLE001 — lxml may raise parser-specific exceptions
+    except Exception as e:  # lxml may raise parser-specific exceptions
         out["parse_error"] = f"html parse failed ({type(e).__name__}: {e})"
         return out
     out["parse_ok"] = True
@@ -138,7 +138,7 @@ def render_and_capture(html_path: Path, out_dir: Path) -> dict:
            "render_note": ""}
     try:
         from playwright.sync_api import sync_playwright
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         out["render_note"] = f"playwright unavailable ({type(e).__name__}: {e})"
         return out
 
@@ -148,7 +148,7 @@ def render_and_capture(html_path: Path, out_dir: Path) -> dict:
         with sync_playwright() as p:
             try:
                 browser = p.chromium.launch()
-            except Exception as e:  # noqa: BLE001 — chromium not installed
+            except Exception as e:  # chromium may be unavailable
                 out["render_note"] = (f"chromium launch failed ({type(e).__name__}: {e}) "
                                       "— run: uv run playwright install chromium")
                 return out
@@ -169,7 +169,7 @@ def render_and_capture(html_path: Path, out_dir: Path) -> dict:
                         node.scroll_into_view_if_needed()
                         node.screenshot(path=str(shot))
                         out["screenshot_paths"].append(shot.name)
-                    except Exception as e:  # noqa: BLE001 — keep rendering other slides
+                    except Exception as e:  # keep rendering other slides
                         failed += 1
                         last_error = e
             if not out["screenshot_paths"]:
@@ -189,7 +189,7 @@ def render_and_capture(html_path: Path, out_dir: Path) -> dict:
             out["rendered_ok"] = True
             out["console_errors"] = len(errors)
             browser.close()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         out["render_note"] = f"render failed ({type(e).__name__}: {e})"
     return out
 

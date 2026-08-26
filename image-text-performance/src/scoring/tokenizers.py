@@ -37,7 +37,7 @@ def _get_mecab():
         m.morphs("테스트")  # 실제 동작 확인 (백엔드 없으면 여기서 예외)
         _mecab = m
         _backend = "mecab"
-    except Exception as e:  # noqa: BLE001 — konlpy backends may raise varied exception types
+    except Exception as e:  # konlpy backends may raise varied exception types
         _mecab = None
         _backend = "syllable"
         print(

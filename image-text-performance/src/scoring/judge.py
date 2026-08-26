@@ -12,6 +12,9 @@ Key components:
 - load_rubrics: Load task-specific scoring rubrics from YAML config.
 - build_judge_prompt: Compose a scoring prompt with anchored rubric to
   mitigate position and verbosity bias.
+- resolve_rubric: Load a task rubric with a fallback when config is missing.
+- judge_batch: Call the judge for a list of JudgeItem and return 1–5 scores,
+  substituting a fallback score on call/parse failure.
 - score_with_judge: **Phase 1 stub** that will call the judge via FMAPIClient
   and parse the result.
 
@@ -20,9 +23,13 @@ bias mitigation (position/verbosity).
 """
 
 import re
-from typing import Optional
+from dataclasses import dataclass
+from collections.abc import Sequence
+from typing import Any, Optional
 
 import yaml
+
+DEFAULT_JUDGE_ENDPOINT = "databricks-gemini-3-1-pro"
 
 
 def parse_judge_score(text: str) -> Optional[int]:
@@ -183,6 +190,103 @@ Please evaluate the candidate output against the reference and provide a score f
 Include brief reasoning, then state your final score clearly (e.g., "Score: 4").
 """
     return prompt
+
+
+def resolve_rubric(
+    task_id: str,
+    fallback: dict | None = None,
+    path: str = "config/judge_rubrics.yaml",
+) -> dict:
+    """task_id의 루브릭을 로드. 없거나 로드 실패면 fallback을 사용.
+
+    Args:
+        task_id: 태스크 식별자 (예: "TXT-1").
+        fallback: 루브릭이 없을 때 쓸 기본 루브릭.
+        path: 루브릭 YAML 경로.
+
+    Returns:
+        {name, description, anchors} 형태의 루브릭 (없으면 fallback 또는 {}).
+    """
+    try:
+        rubrics = load_rubrics(path)
+    except Exception as e:  # noqa: BLE001 - 루브릭 부재/파싱 오류 모두 fallback 처리
+        print(f"Warning: 루브릭 로드 실패 ({path}): {e}")
+        rubrics = {}
+
+    return rubrics.get(task_id) or dict(fallback or {})
+
+
+@dataclass
+class JudgeItem:
+    """judge 호출 1건에 필요한 입력."""
+
+    question: str
+    reference: str
+    candidate: str
+    sample_id: Any = None
+
+
+def judge_batch(
+    judge_client: Any,
+    items: Sequence[JudgeItem],
+    *,
+    task_id: str,
+    rubric: dict,
+    judge_endpoint: str = DEFAULT_JUDGE_ENDPOINT,
+    max_tokens: int = 256,
+    fallback_score: int | None = 3,
+    skip_empty: bool = False,
+    extra_params: dict | None = None,
+) -> list[int | None]:
+    """항목별로 judge를 호출해 1–5 점수 리스트를 반환.
+
+    호출 실패나 점수 파싱 실패 시 fallback_score를 사용한다(None이면 미평가로 남김).
+
+    Args:
+        judge_client: FMAPIClient (chat 메서드를 가진 클라이언트).
+        items: judge 입력 목록. 반환 리스트는 이 순서와 1:1 대응.
+        task_id: 프롬프트에 표시할 태스크 식별자.
+        rubric: resolve_rubric 결과.
+        judge_endpoint: judge 모델 엔드포인트.
+        max_tokens: judge 응답 토큰 상한.
+        fallback_score: 실패 시 사용할 점수 (일반적으로 중간값 3).
+        skip_empty: True면 빈 candidate는 호출 없이 None 처리.
+        extra_params: chat 호출에 그대로 전달할 추가 파라미터.
+
+    Returns:
+        items와 같은 길이의 점수 리스트 (실패 시 fallback_score 또는 None).
+    """
+    scores: list[int | None] = []
+
+    for item in items:
+        if skip_empty and not item.candidate:
+            scores.append(None)
+            continue
+
+        prompt = build_judge_prompt(
+            task_id=task_id,
+            question=item.question,
+            reference=item.reference,
+            candidate=item.candidate,
+            rubric=rubric,
+        )
+
+        try:
+            response = judge_client.chat(
+                endpoint=judge_endpoint,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                extra_params=extra_params,
+            )
+        except Exception as e:  # noqa: BLE001 - 개별 샘플 실패는 전체 평가를 막지 않음
+            print(f"Judge 호출 실패 (샘플 {item.sample_id}): {e}")
+            scores.append(fallback_score)
+            continue
+
+        score = parse_judge_score(response.text)
+        scores.append(score if score is not None else fallback_score)
+
+    return scores
 
 
 def score_with_judge(

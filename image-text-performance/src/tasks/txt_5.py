@@ -14,10 +14,11 @@ from __future__ import annotations
 from typing import Any
 
 from src.adapters.fmapi import FMAPIClient, build_text_message
-from src.datasets_loader import load_hf_split, load_registry, resolve_dataset_entry
-from src.scoring.judge import build_judge_prompt, load_rubrics, parse_judge_score
+from src.datasets_loader import load_registry
+from src.scoring.judge import DEFAULT_JUDGE_ENDPOINT, JudgeItem, judge_batch, resolve_rubric
 from src.scoring.tokenizers import korean_tokenizer_backend, tokenize
 from src.tasks.base import Task, Sample, register
+from src.tasks.common import detect_column, language_batches, mean
 
 
 def _compute_rouge(pred: str, gold: str, lang: str) -> dict[str, float]:
@@ -75,36 +76,24 @@ class Txt5Task(Task):
         각 언어별 컬럼명(article/document, highlights/summary)을 자동 감지하고
         문서가 너무 길면 6000자 제한.
         """
-        registry = load_registry()
-        config = self.config
-
-        if "datasets" not in config:
-            raise ValueError("config에 datasets 맵이 없음")
-
-        datasets_map = config["datasets"]  # {en: summarization_en, ko: summarization_ko}
         samples = []
         sample_id = 0
 
-        # 언어별 샘플 수 분할
-        n_per_lang = max(1, n // len(datasets_map))
-        remainder = n % len(datasets_map)
-
-        for lang_idx, (lang, dataset_key) in enumerate(datasets_map.items()):
-            # 각 언어에 할당할 샘플 수
-            n_lang = n_per_lang + (1 if lang_idx < remainder else 0)
-
-            # 레지스트리에서 데이터셋 메타 조회
-            dataset_entry = resolve_dataset_entry(registry, dataset_key)
-            hf_id = dataset_entry["hf_id"]
-            split = dataset_entry.get("split", "train")
-            config_name = dataset_entry.get("config")
-
-            # HF 데이터셋 로드 (seed 고정)
-            hf_ds = load_hf_split(hf_id, split, n_lang, seed, config_name)
+        for batch in language_batches(self.config, n, seed):
+            hf_ds = batch.rows
 
             # 컬럼명 자동 감지
-            col_article = self._detect_article_column(hf_ds)
-            col_summary = self._detect_summary_column(hf_ds)
+            col_article = detect_column(
+                hf_ds,
+                ["article", "document", "text", "content"],
+                exclude=["summary", "highlights", "label"],
+                what="문서 컬럼",
+            )
+            col_summary = detect_column(
+                hf_ds,
+                ["summary", "highlights", "summary_text", "target"],
+                what="요약 컬럼",
+            )
 
             for idx, row in enumerate(hf_ds):
                 article_raw = row[col_article]
@@ -128,9 +117,9 @@ class Txt5Task(Task):
                     sample_id=sample_id,
                     inputs={"document": article},
                     reference=reference,
-                    lang=lang,
+                    lang=batch.lang,
                     meta={
-                        "dataset": dataset_key,
+                        "dataset": batch.dataset_key,
                         "source_idx": idx,
                     },
                 )
@@ -138,31 +127,6 @@ class Txt5Task(Task):
                 sample_id += 1
 
         return samples
-
-    def _detect_article_column(self, hf_ds: Any) -> str:
-        """HF 데이터셋에서 문서/기사 컬럼명을 자동 감지."""
-        column_names = list(hf_ds[0].keys()) if hf_ds else []
-
-        for col in ["article", "document", "text", "content"]:
-            if col in column_names:
-                return col
-
-        # 실패 시 첫 번째 문자열 컬럼 사용 (summary/highlights 제외)
-        for col in column_names:
-            if col not in ["summary", "highlights", "label"]:
-                return col
-
-        raise ValueError(f"문서 컬럼을 찾을 수 없음. 컬럼: {column_names}")
-
-    def _detect_summary_column(self, hf_ds: Any) -> str:
-        """HF 데이터셋에서 요약 컬럼명을 자동 감지."""
-        column_names = list(hf_ds[0].keys()) if hf_ds else []
-
-        for col in ["summary", "highlights", "summary_text", "target"]:
-            if col in column_names:
-                return col
-
-        raise ValueError(f"요약 컬럼을 찾을 수 없음. 컬럼: {column_names}")
 
     def build_prompt(self, sample: Sample) -> list[dict[str, Any]]:
         """요약 생성 프롬프트 구성.
@@ -219,14 +183,10 @@ Summary:"""
         per_language = {}
         for lang, scores_list in rouge_scores_per_lang.items():
             if scores_list:
-                avg_rouge1 = sum(s["rouge1"] for s in scores_list) / len(scores_list)
-                avg_rouge2 = sum(s["rouge2"] for s in scores_list) / len(scores_list)
-                avg_rougeL = sum(s["rougeL"] for s in scores_list) / len(scores_list)
-
                 per_language[lang] = {
-                    "rouge1": avg_rouge1,
-                    "rouge2": avg_rouge2,
-                    "rougeL": avg_rougeL,
+                    "rouge1": mean([s["rouge1"] for s in scores_list]),
+                    "rouge2": mean([s["rouge2"] for s in scores_list]),
+                    "rougeL": mean([s["rougeL"] for s in scores_list]),
                     "n_evaluated": len(scores_list),
                 }
             else:
@@ -239,19 +199,11 @@ Summary:"""
 
         # 전체 평균 (모든 샘플)
         all_scores = rouge_scores_per_lang["en"] + rouge_scores_per_lang["ko"]
-        if all_scores:
-            overall_rouge1 = sum(s["rouge1"] for s in all_scores) / len(all_scores)
-            overall_rouge2 = sum(s["rouge2"] for s in all_scores) / len(all_scores)
-            overall_rougeL = sum(s["rougeL"] for s in all_scores) / len(all_scores)
-        else:
-            overall_rouge1 = 0.0
-            overall_rouge2 = 0.0
-            overall_rougeL = 0.0
 
         return {
-            "rouge1": overall_rouge1,
-            "rouge2": overall_rouge2,
-            "rougeL": overall_rougeL,
+            "rouge1": mean([s["rouge1"] for s in all_scores]),
+            "rouge2": mean([s["rouge2"] for s in all_scores]),
+            "rougeL": mean([s["rougeL"] for s in all_scores]),
             "n_evaluated": len(parsed),
             "per_language": per_language,
             "bertscore": "deferred (torch 미설치)",
@@ -263,21 +215,9 @@ Summary:"""
         parsed: list[str],
         samples: list[Sample],
         judge_client: FMAPIClient,
-        judge_endpoint: str = "databricks-gemini-3-1-pro",
+        judge_endpoint: str = DEFAULT_JUDGE_ENDPOINT,
     ) -> dict[str, Any]:
         """LLM 판사를 이용한 요약 품질 평가.
-
-        각 샘플에 대해:
-        1. 판사 프롬프트 구성 (원문, 참조 요약, 모델 요약)
-        2. 판사 모델 호출
-        3. 1-5 스코어 파싱
-        4. 샘플별 점수 + 평균 반환
-
-        Args:
-            parsed: 생성된 요약 리스트
-            samples: Sample 리스트 (언어, 참조 요약 포함)
-            judge_client: FMAPI 클라이언트
-            judge_endpoint: 판사 모델 엔드포인트
 
         Returns:
             dict with keys:
@@ -286,59 +226,38 @@ Summary:"""
             - n_evaluated: 평가된 샘플 수
             - per_language: 언어별 평균 점수
         """
-        rubrics = load_rubrics()
-        rubric = rubrics.get("TXT-5", {})
-
-        scores = []
-        scores_per_lang = {"en": [], "ko": []}
-
-        for pred, sample in zip(parsed, samples):
-            document = sample.inputs["document"]
-            reference = sample.reference
-            lang = sample.lang
-
-            # 판사 프롬프트 구성
-            judge_prompt = build_judge_prompt(
-                task_id="TXT-5",
-                question=f"Summarize the following document (language: {lang}):",
-                reference=reference,
+        items = [
+            JudgeItem(
+                question=f"Summarize the following document (language: {sample.lang}):",
+                reference=str(sample.reference),
                 candidate=pred,
-                rubric=rubric,
+                sample_id=sample.sample_id,
             )
+            for pred, sample in zip(parsed, samples)
+        ]
 
-            # 판사 모델 호출
-            messages = build_text_message(judge_prompt)
-            judge_response = judge_client.chat(
-                endpoint=judge_endpoint,
-                messages=messages,
-                max_tokens=256,
-            )
-
-            # 스코어 파싱
-            judge_score = parse_judge_score(judge_response.text)
-            if judge_score is None:
-                judge_score = 3  # 파싱 실패 시 중간값
-
-            scores.append(judge_score)
-            scores_per_lang[lang].append(judge_score)
+        scores = judge_batch(
+            judge_client,
+            items,
+            task_id=self.task_id,
+            rubric=resolve_rubric(self.task_id),
+            judge_endpoint=judge_endpoint,
+        )
 
         # 언어별 평균
         per_language = {}
         for lang in ["en", "ko"]:
-            if scores_per_lang[lang]:
-                mean_score = sum(scores_per_lang[lang]) / len(scores_per_lang[lang])
-                per_language[lang] = {
-                    "mean": mean_score,
-                    "n": len(scores_per_lang[lang]),
-                }
-            else:
-                per_language[lang] = {"mean": None, "n": 0}
-
-        # 전체 평균
-        mean_score = sum(scores) / len(scores) if scores else 3.0
+            lang_scores = [
+                score for score, sample in zip(scores, samples) if sample.lang == lang
+            ]
+            per_language[lang] = (
+                {"mean": mean(lang_scores), "n": len(lang_scores)}
+                if lang_scores
+                else {"mean": None, "n": 0}
+            )
 
         return {
-            "judge_score_mean": mean_score,
+            "judge_score_mean": mean(scores, default=3.0),
             "judge_scores": scores,
             "n_evaluated": len(scores),
             "per_language": per_language,

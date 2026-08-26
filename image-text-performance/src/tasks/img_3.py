@@ -19,14 +19,13 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from src.adapters.fmapi import build_image_message, FMAPIClient
 from src.adapters.images import pil_to_data_url
-from src.datasets_loader import load_hf_split, load_registry, resolve_dataset_entry
-from src.scoring.metrics import binary_metrics
+from src.datasets_loader import load_registry
 from src.tasks.base import Task, Sample, register
+from src.tasks.common import binary_score_summary, load_dataset_rows, parse_binary_label
 
 
 @register
@@ -53,20 +52,13 @@ class Img3Task(Task):
         객체 카테고리에 무기 클래스가 하나라도 있으면 label=1(무기 있음),
         없으면 label=0(무기 없음).
         """
-        registry = load_registry()
-        dataset_entry = resolve_dataset_entry(registry, "weapon")
-
-        hf_id = dataset_entry["hf_id"]
-        split = dataset_entry.get("split", "validation")
-        config_name = dataset_entry.get("config")
-
         # 무기/위협 클래스 ID (WeaponDetection 데이터셋)
         WEAPON_CLASS_IDS = {3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 19, 23, 24, 25, 26, 28}
 
         # HF 데이터셋 로드 (큰 데이터셋이므로 더 큰 슬라이스를 로드한 후 필터링)
         # 밸런스 확보를 위해 더 많이 로드
         load_n = max(n * 3, 150)
-        hf_ds = load_hf_split(hf_id, split, load_n, seed, config_name)
+        hf_ds = load_dataset_rows("weapon", load_n, seed, default_split="validation")
 
         samples = []
         sample_id = 0
@@ -135,26 +127,12 @@ class Img3Task(Task):
         부정 표현("no", "not") 우선 검사로 "no weapon" 오분류 방지.
         파싱 불가 시 None 반환.
         """
-        if not raw_text or not raw_text.strip():
-            return None
-
-        text_lower = raw_text.strip().lower()
-
-        # 부정 표현 먼저 검사 ("no weapon"은 0이어야 함)
-        if "no" in text_lower or "not" in text_lower or "none" in text_lower:
-            return 0
-
-        # 긍정 표현 → 1
-        if "yes" in text_lower or "threat" in text_lower or "weapon" in text_lower:
-            return 1
-
-        # 숫자로도 시도: 1/0
-        if re.search(r"\b1\b", text_lower):
-            return 1
-        if re.search(r"\b0\b", text_lower):
-            return 0
-
-        return None
+        return parse_binary_label(
+            raw_text,
+            positive=("yes", "threat", "weapon"),
+            negative=("no", "not", "none"),
+            negative_first=True,
+        )
 
     def score(self, parsed: list[int | None], samples: list[Sample]) -> dict[str, Any]:
         """파싱된 예측 결과를 집계해 메트릭 계산.
@@ -164,39 +142,11 @@ class Img3Task(Task):
         - 혼동 행렬(confusion matrix) 포함
         - 클래스 밸런스 포함
         """
-        # None값 필터링
-        valid_indices = [i for i, p in enumerate(parsed) if p is not None]
-
-        if not valid_indices:
-            return {
-                "accuracy": 0.0,
-                "f1": 0.0,
-                "confusion_matrix": {"tn": 0, "fp": 0, "fn": 0, "tp": 0},
-                "n_evaluated": 0,
-                "n_unparsed": len(parsed),
-                "class_balance": {"class_0": 0, "class_1": 0},
-            }
-
-        preds_valid = [parsed[i] for i in valid_indices]
-        golds_valid = [samples[i].reference for i in valid_indices]
-
-        # 메트릭 계산
-        metrics = binary_metrics(preds_valid, golds_valid)
-
-        # 클래스 밸런스
-        class_balance = {
-            "class_0": sum(1 for g in golds_valid if g == 0),
-            "class_1": sum(1 for g in golds_valid if g == 1),
-        }
-
-        return {
-            "accuracy": metrics["accuracy"],
-            "f1": metrics["f1"],
-            "confusion_matrix": metrics["confusion_matrix"],
-            "n_evaluated": len(valid_indices),
-            "n_unparsed": len(parsed) - len(valid_indices),
-            "class_balance": class_balance,
-        }
+        return binary_score_summary(
+            parsed,
+            samples,
+            class_balance_keys=("class_0", "class_1"),
+        )
 
 
 if __name__ == "__main__":

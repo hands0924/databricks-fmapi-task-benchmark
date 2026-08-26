@@ -12,15 +12,14 @@
 
 from __future__ import annotations
 
-import re
 import random
 from typing import Any
 
 from src.adapters.fmapi import FMAPIClient, build_image_message
 from src.adapters.images import pil_to_data_url
-from src.datasets_loader import load_hf_split, load_registry, resolve_dataset_entry
-from src.scoring.metrics import binary_metrics
+from src.datasets_loader import load_hf_split, load_registry
 from src.tasks.base import Task, Sample, register
+from src.tasks.common import binary_score_summary, parse_binary_label
 
 
 @register
@@ -41,7 +40,6 @@ class Img4Task(Task):
 
         캐시에서만 로드 (D3). 이미지는 메모리 전용, 저장 금지.
         """
-        registry = load_registry()
         n_pos = n // 2  # NSFW 샘플 수
         n_neg = n - n_pos  # SFW 샘플 수
 
@@ -164,27 +162,7 @@ class Img4Task(Task):
         대소문자 무시, 다양한 형식 허용.
         파싱 불가능 시 None 반환 (safety refusal 등).
         """
-        if not raw_text or not raw_text.strip():
-            return None
-
-        text_lower = raw_text.strip().lower()
-
-        # NSFW 판정
-        if "nsfw" in text_lower:
-            return 1
-
-        # SFW/SAFE 판정
-        if "safe" in text_lower:
-            return 0
-
-        # 숫자 폴백 (1 → NSFW, 0 → SFW)
-        if re.search(r"\b1\b", text_lower):
-            return 1
-        if re.search(r"\b0\b", text_lower):
-            return 0
-
-        # 파싱 불가 (model refusal 등)
-        return None
+        return parse_binary_label(raw_text, positive=("nsfw",), negative=("safe",))
 
     def score(self, parsed: list[int | None], samples: list[Sample]) -> dict[str, Any]:
         """파싱된 예측을 집계해 메트릭 계산 (D3: 이미지 content 미포함).
@@ -196,49 +174,11 @@ class Img4Task(Task):
         - class_balance: 정답의 클래스 분포
         - 메타데이터는 비민감 정보만 (이미지 데이터 절대 미포함)
         """
-        # None 값 필터링
-        valid_indices = [i for i, p in enumerate(parsed) if p is not None]
-
-        if not valid_indices:
-            # 모든 샘플 파싱 실패
-            return {
-                "accuracy": 0.0,
-                "f1": 0.0,
-                "confusion_matrix": {
-                    "tn": 0,
-                    "fp": 0,
-                    "fn": 0,
-                    "tp": 0,
-                },
-                "n_evaluated": 0,
-                "n_unparsed": len(parsed),
-                "class_balance": {
-                    "sfw_count": 0,
-                    "nsfw_count": 0,
-                },
-            }
-
-        preds_valid = [parsed[i] for i in valid_indices]
-        golds_valid = [samples[i].reference for i in valid_indices]
-
-        # 메트릭 계산
-        metrics = binary_metrics(preds_valid, golds_valid)
-
-        # 정답 클래스 분포
-        n_sfw = sum(1 for g in golds_valid if g == 0)
-        n_nsfw = sum(1 for g in golds_valid if g == 1)
-
-        return {
-            "accuracy": metrics["accuracy"],
-            "f1": metrics["f1"],
-            "confusion_matrix": metrics["confusion_matrix"],
-            "n_evaluated": len(valid_indices),
-            "n_unparsed": len(parsed) - len(valid_indices),
-            "class_balance": {
-                "sfw_count": n_sfw,
-                "nsfw_count": n_nsfw,
-            },
-        }
+        return binary_score_summary(
+            parsed,
+            samples,
+            class_balance_keys=("sfw_count", "nsfw_count"),
+        )
 
 
 if __name__ == "__main__":

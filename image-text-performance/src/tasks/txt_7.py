@@ -12,9 +12,10 @@ import re
 from typing import Any
 
 from src.adapters.fmapi import FMAPIClient, build_text_message
-from src.datasets_loader import load_hf_split, load_registry, resolve_dataset_entry
+from src.datasets_loader import load_registry
 from src.scoring.metrics import multilabel_prf
 from src.tasks.base import Task, Sample, register
+from src.tasks.common import detect_column, load_dataset_rows
 
 
 def normalize_keyphrase(phrase: str) -> str:
@@ -52,24 +53,16 @@ class Txt7Task(Task):
 
         NOTE: 실제 데이터셋이 로드되지 않으면 예외를 발생시킴. 합성 데이터 폴백 없음.
         """
-        registry = load_registry()
-        config = self.config
-
-        if "datasets" not in config:
+        datasets_map = self.config.get("datasets")  # {en: keyphrase}
+        if not datasets_map:
             raise ValueError("config에 datasets 맵이 없음")
 
-        datasets_map = config["datasets"]  # {en: keyphrase}
         samples = []
         sample_id = 0
 
         for lang, dataset_key in datasets_map.items():
-            dataset_entry = resolve_dataset_entry(registry, dataset_key)
-            hf_id = dataset_entry["hf_id"]
-            split = dataset_entry.get("split", "test")
-            config_name = dataset_entry.get("config", None)
-
             # 실제 데이터셋 로드 (실패 시 예외 발생)
-            hf_ds = load_hf_split(hf_id, split, n, seed, config_name)
+            hf_ds = load_dataset_rows(dataset_key, n, seed, default_split="test")
 
             # 컬럼명 감지
             col_title = self._detect_title_column(hf_ds)
@@ -152,55 +145,27 @@ class Txt7Task(Task):
 
         return keyphrases_set
 
-    def _detect_title_column(self, hf_ds: Any) -> str:
-        """제목 컬럼명 감지.
+    def _detect_title_column(self, hf_ds: list[dict[str, Any]]) -> str:
+        """제목 컬럼명 감지."""
+        return detect_column(
+            hf_ds, ["title", "document_title", "text_title"], what="제목 컬럼"
+        )
 
-        load_hf_split은 항상 list[dict]를 반환함.
-        """
-        if not hf_ds:
-            raise ValueError("데이터셋이 비어있음")
+    def _detect_abstract_column(self, hf_ds: list[dict[str, Any]]) -> str:
+        """초록 컬럼명 감지 (memray/inspec은 'abstract' 또는 'fulltext')."""
+        return detect_column(
+            hf_ds,
+            ["abstract", "fulltext", "text", "document", "content"],
+            what="초록 컬럼",
+        )
 
-        columns = hf_ds[0].keys()
-
-        for col in ["title", "document_title", "text_title"]:
-            if col in columns:
-                return col
-
-        raise ValueError(f"제목 컬럼을 찾을 수 없음. 사용 가능한 컬럼: {list(columns)}")
-
-    def _detect_abstract_column(self, hf_ds: Any) -> str:
-        """초록 컬럼명 감지.
-
-        load_hf_split은 항상 list[dict]를 반환함.
-        memray/inspec의 경우 'abstract' 또는 'fulltext' 컬럼 사용.
-        """
-        if not hf_ds:
-            raise ValueError("데이터셋이 비어있음")
-
-        columns = hf_ds[0].keys()
-
-        for col in ["abstract", "fulltext", "text", "document", "content"]:
-            if col in columns:
-                return col
-
-        raise ValueError(f"초록 컬럼을 찾을 수 없음. 사용 가능한 컬럼: {list(columns)}")
-
-    def _detect_keyphrases_column(self, hf_ds: Any) -> str:
-        """키프레이즈 컬럼명 감지.
-
-        load_hf_split은 항상 list[dict]를 반환함.
-        memray/inspec의 경우 'keywords' 컬럼 사용 (세미콜론 구분).
-        """
-        if not hf_ds:
-            raise ValueError("데이터셋이 비어있음")
-
-        columns = hf_ds[0].keys()
-
-        for col in ["keywords", "keyphrases", "keyphrase", "keyword", "prmu"]:
-            if col in columns:
-                return col
-
-        raise ValueError(f"키프레이즈 컬럼을 찾을 수 없음. 사용 가능한 컬럼: {list(columns)}")
+    def _detect_keyphrases_column(self, hf_ds: list[dict[str, Any]]) -> str:
+        """키프레이즈 컬럼명 감지 (memray/inspec은 세미콜론 구분 'keywords')."""
+        return detect_column(
+            hf_ds,
+            ["keywords", "keyphrases", "keyphrase", "keyword", "prmu"],
+            what="키프레이즈 컬럼",
+        )
 
     def build_prompt(self, sample: Sample) -> list[dict[str, Any]]:
         """문서를 제시하고 키프레이즈 추출 요청.

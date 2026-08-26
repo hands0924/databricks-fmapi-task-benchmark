@@ -16,13 +16,13 @@ LLM 판사(judge)를 통한 정성적 평가도 지원한다.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
-from src.adapters.fmapi import build_text_message, FMAPIClient
-from src.datasets_loader import load_hf_split, load_registry, resolve_dataset_entry
+from src.adapters.fmapi import FMAPIClient, build_text_message
+from src.datasets_loader import load_registry
 from src.scoring.metrics import token_f1
-from src.scoring.judge import load_rubrics, build_judge_prompt, parse_judge_score
 from src.tasks.base import Task, Sample, register
+from src.tasks.common import best_reference_score, mean, single_language_rows
 
 
 def _normalize_answer(answer: str) -> str:
@@ -67,25 +67,9 @@ class Txt2Task(Task):
 
         마크다운 테이블을 입력으로 사용.
         """
-        registry = load_registry()
-        config = self.config
-
-        if "datasets" not in config or "en" not in config["datasets"]:
-            raise ValueError("config에 datasets.en (table_qa)가 없음")
-
-        dataset_key = config["datasets"]["en"]
-        dataset_entry = resolve_dataset_entry(registry, dataset_key)
-
-        hf_id = dataset_entry["hf_id"]
-        split = dataset_entry.get("split", "train")
-        config_name = dataset_entry.get("config")
-
-        # split이 "default"이면 "train"으로 치환 (일부 HF 데이터셋 호환성)
-        if split == "default":
-            split = "train"
-
-        # HF 데이터셋 로드 (seed 고정)
-        hf_ds = load_hf_split(hf_id, split, n, seed, config_name)
+        dataset_key, hf_ds = single_language_rows(
+            self.config, "en", n, seed, dataset_hint="table_qa"
+        )
 
         samples = []
         for sample_id, row in enumerate(hf_ds):
@@ -224,102 +208,32 @@ Answer:"""
             accuracy_scores.append(max_accuracy)
 
             # Token-F1: 모든 정답 중 최고값
-            max_f1 = 0.0
-            for gold in reference_list:
-                f1 = token_f1(pred, gold, "en")
-                max_f1 = max(max_f1, f1)
-
-            token_f1_scores.append(max_f1)
+            token_f1_scores.append(
+                best_reference_score(pred, reference_list, lambda p, g: token_f1(p, g, "en"))
+            )
 
         return {
-            "accuracy": sum(accuracy_scores) / len(accuracy_scores) if accuracy_scores else 0.0,
-            "token_f1": sum(token_f1_scores) / len(token_f1_scores) if token_f1_scores else 0.0,
+            "accuracy": mean(accuracy_scores),
+            "token_f1": mean(token_f1_scores),
             "n_evaluated": len(parsed),
         }
 
-    def judge_scores(
-        self,
-        parsed: list[str],
-        samples: list[Sample],
-        judge_client: FMAPIClient,
-        judge_endpoint: str = "databricks-gemini-3-1-pro",
-    ) -> dict[str, Any]:
-        """LLM 판사를 사용한 정성적 평가.
+    # judge_scores는 Task 기본 구현 사용 (질문/루브릭만 태스크별로 지정)
+    judge_rubric_fallback: ClassVar[dict[str, Any]] = {
+        "name": "Table QA",
+        "description": "Extract accurate cell values from tables",
+        "anchors": {
+            "1": "Extracted value does not match table or is completely wrong",
+            "2": "Extracted value partially matches with errors in key values",
+            "3": "Extracted value mostly correct but with minor cell errors or format issues",
+            "4": "Extracted value nearly accurate with only minor format differences",
+            "5": "Extracted value is accurate and perfectly matches reference cell values",
+        },
+    }
 
-        각 샘플에 대해 판사 모델을 호출해 1-5 점수를 얻는다.
-        """
-        if not parsed or not samples:
-            return {
-                "judge_scores": [],
-                "judge_mean": 0.0,
-                "n_judged": 0,
-            }
-
-        # Rubric 로드
-        try:
-            rubrics = load_rubrics("config/judge_rubrics.yaml")
-        except FileNotFoundError:
-            rubrics = {}
-
-        # TXT-2용 rubric (없으면 generic QA 사용)
-        if "TXT-2" in rubrics:
-            rubric = rubrics["TXT-2"]
-        else:
-            # Fallback: generic table QA rubric
-            rubric = {
-                "name": "Table QA",
-                "description": "Extract accurate cell values from tables",
-                "anchors": {
-                    "1": "Extracted value does not match table or is completely wrong",
-                    "2": "Extracted value partially matches with errors in key values",
-                    "3": "Extracted value mostly correct but with minor cell errors or format issues",
-                    "4": "Extracted value nearly accurate with only minor format differences",
-                    "5": "Extracted value is accurate and perfectly matches reference cell values",
-                }
-            }
-
-        judge_scores = []
-        for pred, sample in zip(parsed, samples):
-            question = sample.inputs["question"]
-            table = sample.inputs["table"]
-            # reference_list 중 첫 번째를 참고정답으로 사용
-            reference = sample.reference[0] if sample.reference else ""
-
-            # Judge prompt 구성
-            judge_prompt = build_judge_prompt(
-                task_id="TXT-2",
-                question=f"Table:\n{table}\n\nQuestion: {question}",
-                reference=reference,
-                candidate=pred,
-                rubric=rubric,
-            )
-
-            try:
-                # Judge 호출
-                response = judge_client.chat(
-                    endpoint=judge_endpoint,
-                    messages=build_text_message(judge_prompt),
-                    max_tokens=256,
-                    extra_params={},
-                )
-
-                # 점수 파싱
-                score = parse_judge_score(response.text)
-                if score is not None:
-                    judge_scores.append(score)
-                else:
-                    judge_scores.append(3)  # 파싱 실패 시 중간값
-            except Exception as e:
-                print(f"Judge 호출 실패 (샘플 {sample.sample_id}): {e}")
-                judge_scores.append(3)  # 오류 시 중간값
-
-        mean_score = sum(judge_scores) / len(judge_scores) if judge_scores else 0.0
-
-        return {
-            "judge_scores": judge_scores,
-            "judge_mean": mean_score,
-            "n_judged": len(judge_scores),
-        }
+    def judge_question(self, sample: Sample) -> str:
+        """테이믋과 질문을 함께 제시."""
+        return f"Table:\n{sample.inputs['table']}\n\nQuestion: {sample.inputs['question']}"
 
 
 if __name__ == "__main__":

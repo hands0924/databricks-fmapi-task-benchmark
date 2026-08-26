@@ -10,16 +10,17 @@ from __future__ import annotations
 
 import urllib.request
 from io import BytesIO
-from typing import Any
+from typing import Any, ClassVar
 
 from PIL import Image
 
 from src.adapters.fmapi import build_image_message, FMAPIClient
 from src.adapters.images import pil_to_data_url
-from src.datasets_loader import load_hf_split, load_registry, resolve_dataset_entry
+from src.datasets_loader import load_registry
 from src.scoring.metrics import token_f1
-from src.scoring.judge import load_rubrics, build_judge_prompt, parse_judge_score
+from src.scoring.judge import DEFAULT_JUDGE_ENDPOINT, JudgeItem, judge_batch, resolve_rubric
 from src.tasks.base import Task, Sample, register
+from src.tasks.common import best_reference_score, load_dataset_rows, mean
 
 
 @register
@@ -37,15 +38,8 @@ class Img1Task(Task):
         이미지를 다운로드해 PIL.Image로 변환한다.
         reference는 5개 캡션 리스트를 저장한다.
         """
-        registry = load_registry()
-        dataset_entry = resolve_dataset_entry(registry, "img_caption")
-
-        hf_id = dataset_entry["hf_id"]
-        split = dataset_entry.get("split", "validation")
-        config_name = dataset_entry.get("config")
-
         # HF 데이터셋 로드
-        hf_ds = load_hf_split(hf_id, split, n, seed, config_name)
+        hf_ds = load_dataset_rows("img_caption", n, seed, default_split="validation")
 
         samples = []
         for idx, row in enumerate(hf_ds):
@@ -117,46 +111,45 @@ class Img1Task(Task):
                 "notes": "bertscore deferred (torch 미설치)",
             }
 
-        valid_count = 0
-        total_f1 = 0.0
-
-        for pred, sample in zip(parsed, samples):
-            if not pred:
-                continue
-
-            # reference는 list of captions
-            references = sample.reference
-            if not isinstance(references, list):
-                references = [references]
-
-            # 최고 token_f1 선택 (best match among references)
-            best_f1 = 0.0
-            for ref in references:
-                f1 = token_f1(pred, ref, lang=sample.lang)
-                best_f1 = max(best_f1, f1)
-
-            total_f1 += best_f1
-            valid_count += 1
-
-        mean_f1 = total_f1 / valid_count if valid_count > 0 else 0.0
+        best_f1_scores = [
+            best_reference_score(
+                pred,
+                sample.reference,
+                lambda p, g, lang=sample.lang: token_f1(p, g, lang=lang),
+            )
+            for pred, sample in zip(parsed, samples)
+            if pred
+        ]
 
         return {
-            "caption_token_f1": float(mean_f1),
-            "n_evaluated": valid_count,
+            "caption_token_f1": float(mean(best_f1_scores)),
+            "n_evaluated": len(best_f1_scores),
             "notes": "bertscore deferred (torch 미설치)",
         }
+
+    judge_rubric_fallback: ClassVar[dict[str, Any]] = {
+        "name": "Image Captioning",
+        "description": "Evaluate image captions for accuracy, completeness, and clarity.",
+        "anchors": {
+            "1": "Inaccurate or missing caption",
+            "2": "Partially correct caption",
+            "3": "Acceptable caption with minor issues",
+            "4": "Good caption with minor omissions",
+            "5": "Excellent, complete, and accurate caption",
+        },
+    }
 
     def judge_scores(
         self,
         parsed: list[str],
         samples: list[Sample],
         judge_client: FMAPIClient,
-        judge_endpoint: str = "databricks-gemini-3-1-pro",
+        judge_endpoint: str = DEFAULT_JUDGE_ENDPOINT,
     ) -> dict[str, Any]:
         """LLM-as-judge로 캡션 품질 평가.
 
         생성된 캡션과 참고 캡션을 텍스트로만 비교 (이미지는 불필요).
-        각 샘플마다 judge 모델을 호출해 1-5 점수를 얻는다.
+        빈 캡션과 judge 호출/파싱 실패는 None으로 기록하고 평균에서 제외한다.
         """
         if not parsed or not samples:
             return {
@@ -165,66 +158,30 @@ class Img1Task(Task):
                 "n_evaluated": 0,
             }
 
-        try:
-            rubrics = load_rubrics()
-            rubric = rubrics.get(self.task_id, {
-                "name": "Image Captioning",
-                "description": "Evaluate image captions for accuracy, completeness, and clarity.",
-                "anchors": {
-                    "1": "Inaccurate or missing caption",
-                    "2": "Partially correct caption",
-                    "3": "Acceptable caption with minor issues",
-                    "4": "Good caption with minor omissions",
-                    "5": "Excellent, complete, and accurate caption",
-                }
-            })
-        except Exception as e:
-            print(f"Warning: 루브릭 로드 실패: {e}")
-            rubric = {}
-
-        judge_scores = []
-
-        for pred, sample in zip(parsed, samples):
-            if not pred:
-                judge_scores.append(None)
-                continue
-
-            references = sample.reference
-            if not isinstance(references, list):
-                references = [references]
-
-            # 최고 점수의 참고 캡션을 선택
-            best_reference = references[0] if references else ""
-
-            # Judge 프롬프트 구성
-            judge_prompt = build_judge_prompt(
-                task_id=self.task_id,
+        items = [
+            JudgeItem(
                 question="Describe this image in one sentence.",
-                reference=best_reference,
+                reference=self.judge_reference(sample),
                 candidate=pred,
-                rubric=rubric,
+                sample_id=sample.sample_id,
             )
+            for pred, sample in zip(parsed, samples)
+        ]
 
-            # Judge 모델 호출
-            try:
-                response = judge_client.chat(
-                    endpoint=judge_endpoint,
-                    messages=[{"role": "user", "content": judge_prompt}],
-                    max_tokens=256,
-                    extra_params=None,
-                )
-                score = parse_judge_score(response.text)
-                judge_scores.append(score)
-            except Exception as e:
-                print(f"Warning: 샘플 {sample.sample_id} judge 호출 실패: {e}")
-                judge_scores.append(None)
+        judge_scores = judge_batch(
+            judge_client,
+            items,
+            task_id=self.task_id,
+            rubric=resolve_rubric(self.task_id, self.judge_rubric_fallback),
+            judge_endpoint=judge_endpoint,
+            fallback_score=None,
+            skip_empty=True,
+        )
 
-        # 유효한 점수만 평균 계산
         valid_scores = [s for s in judge_scores if s is not None]
-        mean_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
 
         return {
-            "judge_score_mean": float(mean_score),
+            "judge_score_mean": float(mean(valid_scores)),
             "judge_scores": judge_scores,
             "n_evaluated": len(valid_scores),
         }

@@ -18,9 +18,14 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# request_id는 FMAPI 응답(헤더 x-request-id 또는 body id)에서 오는 외부 입력이다.
+# SQL에 리터럴로 들어가므로 보수적 allowlist로 검증한다.
+_REQUEST_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,128}\Z")
 
 
 # === 상수: ai_gateway.usage 컬럼 목록 (plan §10) ===
@@ -63,16 +68,18 @@ def build_usage_query(
             WHERE request_id IN (...)
             ORDER BY event_time DESC
 
+    Raises:
+        ValueError: request_id가 allowlist(영숫자·`.`·`_`·`:`·`-`, 128자 이내)를 벗어날 때.
+
     Note:
-        - request_id는 SQL injection 방지를 위해 안전하게 쿼팅.
+        - request_id는 외부 입력이므로 SQL에 넣기 전 allowlist로 검증한다(injection 방지).
         - warehouse_id는 쿼리 실행 시 지정(build_usage_query는 SELECT만 생성).
     """
     if not request_ids:
         logger.warning("request_ids is empty; returning empty result query")
         return "SELECT * FROM system.ai_gateway.usage WHERE 1=0"
 
-    # request_id를 SQL 안전하게 쿼팅 (문자열은 단일인용)
-    quoted_ids = ", ".join(f"'{rid}'" for rid in request_ids)
+    quoted_ids = ", ".join(f"'{_validate_request_id(rid)}'" for rid in request_ids)
 
     # USAGE_COLUMNS를 쿼리에 포함
     columns_str = ", ".join(USAGE_COLUMNS)
@@ -86,6 +93,13 @@ ORDER BY event_time DESC
 """.strip()
 
     return query
+
+
+def _validate_request_id(request_id: Any) -> str:
+    """SQL 리터럴로 쓸 수 있는 request_id만 통과시킨다."""
+    if not isinstance(request_id, str) or not _REQUEST_ID_RE.match(request_id):
+        raise ValueError(f"unsafe request_id for SQL literal: {request_id!r}")
+    return request_id
 
 
 def fetch_usage(

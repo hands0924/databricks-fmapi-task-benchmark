@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 
@@ -48,7 +49,13 @@ def _load_manifest(results_dir: Path) -> dict:
     p = results_dir / "manifest.json"
     if p.exists():
         try:
-            return json.load(open(p, encoding="utf-8"))
-        except Exception:
+            with p.open(encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(
+                f"[리포트] manifest 읽기 실패: {p} "
+                f"({type(e).__name__}: {e})",
+                file=sys.stderr,
+            )
             return {}
     return {}

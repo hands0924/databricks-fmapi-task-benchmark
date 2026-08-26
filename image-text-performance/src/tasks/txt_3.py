@@ -31,28 +31,27 @@ def parse_html_table(html_str: str) -> list[tuple[int, int, str]]:
         [(row_idx, col_idx, cell_text), ...] 리스트
         row_idx, col_idx는 0-based 인덱스
     """
+    if not isinstance(html_str, str):
+        raise TypeError(f"html_str must be a string, got {type(html_str).__name__}")
+
     cells = []
 
-    try:
-        # 간단한 정규식 기반 파싱 (html.parser보다 빠르고 견고)
-        # <tr>...</tr> 블록 추출
-        tr_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
-        td_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL | re.IGNORECASE)
+    # 간단한 정규식 기반 파싱 (html.parser보다 빠르고 견고)
+    # <tr>...</tr> 블록 추출
+    tr_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
+    td_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL | re.IGNORECASE)
 
-        rows = tr_pattern.findall(html_str)
-        for row_idx, row_html in enumerate(rows):
-            col_idx = 0
-            for cell_match in td_pattern.finditer(row_html):
-                cell_text = cell_match.group(1)
-                # HTML 태그 제거 및 공백 정규화
-                cell_text = re.sub(r'<[^>]+>', '', cell_text)
-                cell_text = re.sub(r'\s+', ' ', cell_text).strip()
+    rows = tr_pattern.findall(html_str)
+    for row_idx, row_html in enumerate(rows):
+        col_idx = 0
+        for col_idx, cell_match in enumerate(td_pattern.finditer(row_html)):
+            cell_text = cell_match.group(1)
+            # HTML 태그 제거 및 공백 정규화
+            cell_text = re.sub(r'<[^>]+>', '', cell_text)
+            cell_text = re.sub(r'\s+', ' ', cell_text).strip()
 
-                if cell_text:  # 비어있지 않은 셀만 포함
-                    cells.append((row_idx, col_idx, cell_text))
-                col_idx += 1
-    except Exception:
-        pass
+            if cell_text:  # 비어있지 않은 셀만 포함
+                cells.append((row_idx, col_idx, cell_text))
 
     return cells
 

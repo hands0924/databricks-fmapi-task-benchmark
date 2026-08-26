@@ -19,8 +19,13 @@ workspace bearer token authorizes both.
 import os
 import shutil
 import subprocess
-import tomllib
+import sys
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 compatibility
+    import tomli as tomllib
 
 UCODE_CONFIG = Path.home() / ".codex" / "ucode.config.toml"
 UCODE_PROVIDER = "ucode-databricks"  # [model_providers.<name>] block in the config
@@ -32,7 +37,12 @@ def _ucode_provider_cfg() -> dict:
         return {}
     try:
         cfg = tomllib.loads(UCODE_CONFIG.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        print(
+            f"WARNING: ucode config {UCODE_CONFIG}를 읽을 수 없음 "
+            f"({type(e).__name__}: {e})",
+            file=sys.stderr,
+        )
         return {}
     return cfg.get("model_providers", {}).get(UCODE_PROVIDER, {})
 
@@ -70,7 +80,27 @@ def _token_from_ucode(host: str) -> str | None:
         argv += ["--profile", profile]
     try:
         out = subprocess.run(argv, capture_output=True, text=True, timeout=15, check=True)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "")[:200]
+        print(
+            f"WARNING: ucode auth-token 실행 실패 "
+            f"({type(e).__name__}: {e}; stderr: {stderr})",
+            file=sys.stderr,
+        )
+        return None
+    except subprocess.TimeoutExpired as e:
+        print(
+            f"WARNING: ucode auth-token 시간 초과 "
+            f"({type(e).__name__}: {e})",
+            file=sys.stderr,
+        )
+        return None
+    except OSError as e:
+        print(
+            f"WARNING: ucode auth-token 실행 실패 "
+            f"({type(e).__name__}: {e})",
+            file=sys.stderr,
+        )
         return None
     token = out.stdout.strip()
     return token or None

@@ -16,6 +16,7 @@ Mecab은 시스템 의존성(mecab, mecab-ko-dic)이 필요하다. 미설치 환
 from __future__ import annotations
 
 import re
+import sys
 
 # Mecab 인스턴스 캐시 (최초 1회만 초기화 시도)
 _mecab = None
@@ -36,9 +37,14 @@ def _get_mecab():
         m.morphs("테스트")  # 실제 동작 확인 (백엔드 없으면 여기서 예외)
         _mecab = m
         _backend = "mecab"
-    except Exception:
+    except Exception as e:  # noqa: BLE001 — konlpy backends may raise varied exception types
         _mecab = None
         _backend = "syllable"
+        print(
+            f"Mecab 초기화 실패 ({type(e).__name__}: {e}); "
+            "음절 토큰화로 대체해 채점합니다.",
+            file=sys.stderr,
+        )
     return _mecab
 
 

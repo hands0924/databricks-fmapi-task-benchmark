@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,10 @@ CACHE_DIR = Path(".cache")
 
 def load_registry(path: str | Path = "datasets/registry.yaml") -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        registry = yaml.safe_load(f)
+    if not isinstance(registry, dict):
+        raise ValueError(f"registry 파일이 dict가 아님: {path}")  # noqa: TRY004
+    return registry
 
 
 def _hf_cache_dir() -> str:
@@ -47,6 +51,7 @@ def load_hf_split(
     from datasets import load_dataset
 
     # 1) streaming 시도 (다운로드 최소화)
+    streaming_err: Exception | None = None
     try:
         ds = load_dataset(hf_id, name=config, split=split, streaming=True)
         # buffer shuffle로 앞쪽 편향 완화(전체 셔플은 streaming서 불가). buffer는 n의 배수.
@@ -55,12 +60,33 @@ def load_hf_split(
         rows = list(ds.take(n)) if n else list(ds)
         if rows:
             return rows
-        # streaming이 빈 결과면 폴백
-    except Exception:
-        pass
+        print(
+            f"[데이터셋] streaming 로드 결과가 비어 있어 일반 로드로 폴백: "
+            f"{hf_id} ({split})",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        streaming_err = e
+        print(
+            f"[데이터셋] streaming 로드 실패, 일반 로드로 폴백: "
+            f"{hf_id} ({split}) ({type(e).__name__}: {e})",
+            file=sys.stderr,
+        )
 
     # 2) 폴백: 일반 로드 (작은 데이터셋·mirror parquet). 캐시는 .cache/hf.
-    ds = load_dataset(hf_id, name=config, split=split, cache_dir=_hf_cache_dir())
+    try:
+        ds = load_dataset(hf_id, name=config, split=split, cache_dir=_hf_cache_dir())
+    except Exception as e:  # noqa: BLE001
+        streaming_detail = (
+            f"{type(streaming_err).__name__}: {streaming_err}"
+            if streaming_err
+            else "streaming returned zero rows"
+        )
+        raise RuntimeError(
+            f"데이터셋 로드 실패 (streaming/일반 모두): {hf_id} "
+            f"streaming 오류: {streaming_detail}; "
+            f"일반 로드 오류: {type(e).__name__}: {e}"
+        ) from e
     if n and n < len(ds):
         ds = ds.shuffle(seed=seed).select(range(n))
     # list[dict]로 정규화(streaming 경로와 반환 형식 통일 → 태스크 코드 단순화)
@@ -91,7 +117,12 @@ def get_label_names(hf_id: str, split: str, config: str | None, column: str) -> 
         if hasattr(cur, "feature"):
             cur = cur.feature
         return list(getattr(cur, "names", []) or []) or None
-    except Exception:
+    except Exception as e:  # noqa: BLE001 — datasets backends raise varied exceptions
+        print(
+            f"[데이터셋] 라벨 이름 조회 실패: {hf_id} ({column}) "
+            f"({type(e).__name__}: {e})",
+            file=sys.stderr,
+        )
         return None
 
 

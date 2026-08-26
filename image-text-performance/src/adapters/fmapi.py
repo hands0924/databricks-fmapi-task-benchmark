@@ -43,17 +43,31 @@ def _get_workspace_auth(profile: str) -> tuple[str, str]:
     import json
 
     def _cli(*args: str) -> str:
-        proc = subprocess.run(
-            ["databricks", *args, "--profile", profile],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            proc = subprocess.run(
+                ["databricks", *args, "--profile", profile],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as e:
+            raise FMAPIError(f"databricks CLI 실행 실패: {type(e).__name__}: {e}") from e
         if proc.returncode != 0:
             raise FMAPIError(f"databricks CLI 실패: {' '.join(args)}\n{proc.stderr.strip()}")
         return proc.stdout
 
-    host = json.loads(_cli("auth", "env"))["env"]["DATABRICKS_HOST"]
-    token = json.loads(_cli("auth", "token"))["access_token"]
+    try:
+        host = json.loads(_cli("auth", "env"))["env"]["DATABRICKS_HOST"]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise FMAPIError(
+            f"databricks CLI host 응답 파싱 실패: {type(e).__name__}: {e}"
+        ) from e
+    try:
+        token = json.loads(_cli("auth", "token"))["access_token"]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise FMAPIError(
+            f"databricks CLI token 응답 파싱 실패: {type(e).__name__}: {e}"
+        ) from e
     return host.rstrip("/"), token
 
 
@@ -136,23 +150,32 @@ class FMAPIClient:
         for attempt in range(self.max_retries):
             try:
                 resp = self._client.post(url, json=payload, headers=headers)
-            except httpx.TimeoutException as e:
+            except httpx.RequestError as e:
                 last_err = e
-                self._sleep_backoff(attempt)
+                if attempt < self.max_retries - 1:
+                    self._sleep_backoff(attempt)
                 continue
 
             # 5xx·429는 재시도, 그 외 4xx는 즉시 실패(요청 자체가 잘못)
             if resp.status_code >= 500 or resp.status_code == 429:
                 last_err = FMAPIError(f"{endpoint} HTTP {resp.status_code}: {resp.text[:200]}")
-                self._sleep_backoff(attempt)
+                if attempt < self.max_retries - 1:
+                    self._sleep_backoff(attempt)
                 continue
             if resp.status_code != 200:
                 raise FMAPIError(f"{endpoint} HTTP {resp.status_code}: {resp.text[:300]}")
 
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError as e:
+                raise FMAPIError(
+                    f"{endpoint} 응답이 JSON이 아님: {resp.text[:300]}"
+                ) from e
             return self._parse(data, resp)
 
-        raise FMAPIError(f"{endpoint} 재시도 {self.max_retries}회 모두 실패: {last_err}")
+        raise FMAPIError(
+            f"{endpoint} 재시도 {self.max_retries}회 모두 실패: {last_err}"
+        ) from last_err
 
     def _parse(self, data: dict[str, Any], resp: httpx.Response) -> ChatResponse:
         try:

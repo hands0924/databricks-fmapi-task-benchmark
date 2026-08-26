@@ -36,6 +36,7 @@ Usage:
 """
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from lxml import html as lxml_html
@@ -66,8 +67,13 @@ def discover_candidates(task: str, filter_names: list[str] | None) -> list[dict]
         if meta_path.exists():
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except Exception:
-                meta = {}
+            except (OSError, json.JSONDecodeError) as e:
+                print(
+                    f"WARNING: {meta_path}를 읽을 수 없음 "
+                    f"({type(e).__name__}: {e})",
+                    file=sys.stderr,
+                )
+                meta = {"meta_error": f"{type(e).__name__}: {e}"}
         out.append({"dir": d, "name": d.name, "meta": meta})
     return out
 
@@ -78,16 +84,21 @@ def validate_html(html_path: Path, cfg: dict) -> dict:
     out = {
         "parse_ok": False, "has_doctype": False, "slide_count": 0,
         "slide_count_ok": False, "keywords_found": 0, "keywords_total": 0,
-        "keywords_missing": [], "external_refs": 0,
+        "keywords_missing": [], "external_refs": 0, "parse_error": "",
     }
-    if not html_path.exists() or html_path.stat().st_size == 0:
+    if not html_path.exists():
+        out["parse_error"] = "slides.html missing"
+        return out
+    if html_path.stat().st_size == 0:
+        out["parse_error"] = "slides.html is empty"
         return out
 
     raw = html_path.read_text(encoding="utf-8", errors="replace")
     out["has_doctype"] = raw.lstrip().lower().startswith("<!doctype")
     try:
         doc = lxml_html.fromstring(raw)
-    except Exception:
+    except Exception as e:  # noqa: BLE001 — lxml may raise parser-specific exceptions
+        out["parse_error"] = f"html parse failed ({type(e).__name__}: {e})"
         return out
     out["parse_ok"] = True
 
@@ -149,6 +160,8 @@ def render_and_capture(html_path: Path, out_dir: Path) -> dict:
 
             # Per-slide clips if discrete DOM nodes exist; else one full-page shot.
             nodes = page.query_selector_all(".slide") or page.query_selector_all("section")
+            failed = 0
+            last_error: Exception | None = None
             if nodes:
                 for i, node in enumerate(nodes, 1):
                     shot = out_dir / f"slide_{i:02d}.png"
@@ -156,13 +169,23 @@ def render_and_capture(html_path: Path, out_dir: Path) -> dict:
                         node.scroll_into_view_if_needed()
                         node.screenshot(path=str(shot))
                         out["screenshot_paths"].append(shot.name)
-                    except Exception:
-                        pass
+                    except Exception as e:  # noqa: BLE001 — keep rendering other slides
+                        failed += 1
+                        last_error = e
             if not out["screenshot_paths"]:
                 shot = out_dir / "slide_full.png"
                 page.screenshot(path=str(shot), full_page=True)
                 out["screenshot_paths"].append(shot.name)
 
+            if failed:
+                failure_note = (
+                    f"{failed}/{len(nodes)} slide screenshot(s) failed "
+                    f"(last: {type(last_error).__name__}: {last_error})"
+                )
+                out["render_note"] = (
+                    f"{out['render_note']}; {failure_note}"
+                    if out["render_note"] else failure_note
+                )
             out["rendered_ok"] = True
             out["console_errors"] = len(errors)
             browser.close()
@@ -191,6 +214,10 @@ def grade_one(cand: dict, cfg: dict, do_render: bool) -> dict:
                  and (r["rendered_ok"] or not do_render))
 
     notes = []
+    if v["parse_error"]:
+        notes.append(v["parse_error"])
+    if meta.get("meta_error"):
+        notes.append(meta["meta_error"])
     if v["keywords_missing"]:
         notes.append(f"missing topics: {', '.join(v['keywords_missing'])}")
     if v["external_refs"]:
@@ -312,8 +339,16 @@ def merge_human(task: str, human_path: Path) -> None:
     results_path = task_spec.task_dir(task) / "grade_results.json"
     if not results_path.exists():
         raise SystemExit(f"ERROR: {results_path} not found — run grading first.")
-    rows = json.loads(results_path.read_text(encoding="utf-8"))
-    human = json.loads(human_path.read_text(encoding="utf-8"))
+    try:
+        rows = json.loads(results_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"ERROR: {results_path} is not valid JSON: {e}") from e
+    try:
+        human = json.loads(human_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"ERROR: {human_path} is not valid JSON: {e}") from e
+    if not isinstance(human, dict):
+        raise SystemExit(f"ERROR: {human_path} must contain a JSON object")
     for r in rows:
         h = human.get(r["candidate"], {})
         r["human_score"] = h.get("human_score")

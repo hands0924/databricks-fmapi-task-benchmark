@@ -55,7 +55,7 @@ UCODE_PI_AGENT_DIR = Path.home() / ".ucode" / "pi-home" / ".pi" / "agent"
 
 def candidate_dir(task: str, candidate: str) -> Path:
     """Output dir for one candidate:  <task>/<candidate>/ ."""
-    return task_spec.task_dir(task) / candidate
+    return task_spec.task_dir(task) / task_spec.validate_name(candidate, "candidate")
 
 
 def prepare_workdir(task: str, candidate: str) -> Path:
@@ -63,6 +63,8 @@ def prepare_workdir(task: str, candidate: str) -> Path:
 
     instructions.txt is TASK_DESCRIPTION.md copied verbatim; prompt.txt is COMMON_PROMPT.
     Both are byte-identical across every candidate (the fairness rule)."""
+    # candidate_dir validates the names, so the rmtree below can only ever hit a single
+    # directory inside the task dir (never a traversal like '../..').
     workdir = candidate_dir(task, candidate)
     if workdir.exists():
         shutil.rmtree(workdir)

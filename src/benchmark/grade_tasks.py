@@ -35,8 +35,10 @@ Usage:
   # equivalently:  python -m benchmark.grade_tasks --task ...
 """
 import argparse
+import html
 import json
 from pathlib import Path
+from urllib.parse import quote
 
 from lxml import html as lxml_html
 
@@ -120,11 +122,16 @@ def validate_html(html_path: Path, cfg: dict) -> dict:
 
 
 # --------------------------------------------------------------- rendering ---
-def render_and_capture(html_path: Path, out_dir: Path) -> dict:
+def render_and_capture(html_path: Path, out_dir: Path, allow_network: bool = False) -> dict:
     """Headless Chromium render via Playwright: collect console/page errors and screenshot
-    each slide. Returns rendered_ok, console_errors, screenshot_paths."""
+    each slide. Returns rendered_ok, console_errors, screenshot_paths.
+
+    The deck is untrusted, model-generated HTML, so by default every request that is not
+    the local file itself (or an inline data:/blob: URL) is aborted — a deck cannot phone
+    home or exfiltrate anything it reads. Decks are required to be self-contained anyway;
+    pass allow_network=True to grade one that legitimately needs a CDN."""
     out = {"rendered_ok": False, "console_errors": 0, "screenshot_paths": [],
-           "render_note": ""}
+           "render_note": "", "blocked_requests": 0}
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:  # noqa: BLE001
@@ -142,6 +149,8 @@ def render_and_capture(html_path: Path, out_dir: Path) -> dict:
                                       "— run: uv run playwright install chromium")
                 return out
             page = browser.new_page(viewport={"width": 1280, "height": 720})
+            if not allow_network:
+                page.route("**/*", lambda route: _guard_route(route, out))
             page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.goto(html_path.resolve().as_uri(), wait_until="load")
@@ -168,18 +177,32 @@ def render_and_capture(html_path: Path, out_dir: Path) -> dict:
             browser.close()
     except Exception as e:  # noqa: BLE001
         out["render_note"] = f"render failed ({type(e).__name__}: {e})"
+    if out["blocked_requests"]:
+        out["render_note"] = "; ".join(filter(None, [
+            out["render_note"],
+            f"{out['blocked_requests']} network request(s) blocked during render",
+        ]))
     return out
 
 
+def _guard_route(route, out: dict) -> None:
+    """Allow only local (file:) and inline (data:/blob:) fetches; abort everything else."""
+    if route.request.url.startswith(("file:", "data:", "blob:", "about:")):
+        route.continue_()
+    else:
+        out["blocked_requests"] += 1
+        route.abort()
+
+
 # ----------------------------------------------------------------- scoring ---
-def grade_one(cand: dict, cfg: dict, do_render: bool) -> dict:
+def grade_one(cand: dict, cfg: dict, do_render: bool, allow_network: bool = False) -> dict:
     d = cand["dir"]
     meta = cand["meta"]
     html_path = d / task_spec.ARTIFACT
 
     v = validate_html(html_path, cfg)
     r = ({"rendered_ok": False, "console_errors": 0, "screenshot_paths": [], "render_note": "skipped"}
-         if not do_render else render_and_capture(html_path, d / "screenshots"))
+         if not do_render else render_and_capture(html_path, d / "screenshots", allow_network))
 
     kw_cov = (v["keywords_found"] / v["keywords_total"]) if v["keywords_total"] else 0.0
     no_console_err = 1.0 if (r["rendered_ok"] and r["console_errors"] == 0) else 0.0
@@ -241,22 +264,25 @@ def build_gallery(task: str, rows: list[dict], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cards = []
     for r in rows:
-        cand_rel = f"../{r['candidate']}"
+        # Everything below is agent-influenced (dir names, run_meta.json fields, error
+        # text), so it is escaped before landing in the gallery markup.
+        e = {k: html.escape(str(v), quote=True) for k, v in r.items() if k != "screenshots"}
+        cand_url = f"../{quote(str(r['candidate']))}"
         thumbs = "".join(
-            f'<a href="{cand_rel}/screenshots/{s}" target="_blank">'
-            f'<img src="{cand_rel}/screenshots/{s}" loading="lazy"></a>'
+            f'<a href="{cand_url}/screenshots/{quote(str(s))}" target="_blank">'
+            f'<img src="{cand_url}/screenshots/{quote(str(s))}" loading="lazy"></a>'
             for s in r["screenshots"]
         ) or '<p class="muted">(no screenshot — render skipped or failed)</p>'
-        note = f'<p class="note">{r["note"]}</p>' if r["note"] else ""
+        note = f'<p class="note">{e["note"]}</p>' if r["note"] else ""
         cards.append(f"""
-    <div class="card" data-candidate="{r['candidate']}">
-      <h2>{r['candidate']} <span class="muted">/ {r['harness']} / {r['model']}</span></h2>
-      <p class="metrics">valid={r['valid']} · slides={r['slide_count']} ·
-         keywords={r['keywords']} · console_err={r['console_errors']} ·
-         auto={r['auto_score']} · wall={r['wall_seconds']}s</p>
+    <div class="card" data-candidate="{e['candidate']}">
+      <h2>{e['candidate']} <span class="muted">/ {e['harness']} / {e['model']}</span></h2>
+      <p class="metrics">valid={e['valid']} · slides={e['slide_count']} ·
+         keywords={e['keywords']} · console_err={e['console_errors']} ·
+         auto={e['auto_score']} · wall={e['wall_seconds']}s</p>
       {note}
       <div class="thumbs">{thumbs}</div>
-      <p><a href="{cand_rel}/slides.html" target="_blank">open raw slides.html →</a></p>
+      <p><a href="{cand_url}/slides.html" target="_blank">open raw slides.html →</a></p>
       <label>Human score (1-5):
         <select class="human-score"><option value="">—</option>
           <option>1</option><option>2</option><option>3</option>
@@ -264,9 +290,10 @@ def build_gallery(task: str, rows: list[dict], out_path: Path) -> None:
       <label>Notes: <input class="human-note" type="text" size="40"></label>
     </div>""")
 
+    task_esc = html.escape(task, quote=True)
     doc = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
-<title>{task} — review gallery</title>
+<title>{task_esc} — review gallery</title>
 <style>
   body {{ font-family: system-ui, sans-serif; margin: 2rem; background:#fafafa; color:#222; }}
   h1 {{ margin-bottom: .25rem; }}
@@ -283,9 +310,9 @@ def build_gallery(task: str, rows: list[dict], out_path: Path) -> None:
             background:#0a7; color:#fff; cursor:pointer; }}
 </style></head>
 <body>
-<h1>{task} — review gallery</h1>
+<h1>{task_esc} — review gallery</h1>
 <p class="muted">Score each deck 1-5, add notes, then download human_scores.json and run
-<code>python grade_tasks.py --task {task} --merge-human {task}/gallery/human_scores.json</code>.</p>
+<code>python grade_tasks.py --task {task_esc} --merge-human {task_esc}/gallery/human_scores.json</code>.</p>
 <button onclick="dl()">⬇ download human_scores.json</button>
 {''.join(cards)}
 <script>
@@ -337,7 +364,14 @@ def main() -> None:
                     help="skip Playwright rendering (validation only)")
     ap.add_argument("--merge-human", type=Path, default=None,
                     help="merge a downloaded human_scores.json into grade_results.json")
+    ap.add_argument("--allow-render-network", action="store_true",
+                    help="let the rendered deck make network requests (off by default: "
+                         "decks are untrusted model output and must be self-contained)")
     args = ap.parse_args()
+
+    task_spec.validate_name(args.task, "task")
+    for c in args.candidates or []:
+        task_spec.validate_name(c, "candidate")
 
     if args.merge_human is not None:
         merge_human(args.task, args.merge_human)
@@ -348,7 +382,8 @@ def main() -> None:
     if not cands:
         ap.error(f"no candidates found under {args.task}/ — run run_task.py first")
 
-    rows = [grade_one(c, cfg, do_render=not args.no_render) for c in cands]
+    rows = [grade_one(c, cfg, do_render=not args.no_render,
+                      allow_network=args.allow_render_network) for c in cands]
     print_table(args.task, rows)
 
     tdir = task_spec.task_dir(args.task)

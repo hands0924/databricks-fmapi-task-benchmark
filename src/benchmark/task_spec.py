@@ -24,10 +24,15 @@ Nothing in this module has side effects — it is pure constants + functions.
 """
 import json
 import os
+import re
 from pathlib import Path
 
 DEFAULT_TASK = "explain-databricks"
 ARTIFACT = "slides.html"
+
+# Task and candidate names become directory names under the benchmark root, and the
+# runner deletes/recreates <task>/<candidate>/ — so they must stay single path segments.
+NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 # Default candidate -> FMAPI model mapping. The candidate name (opus/sol/glm) is a stable
 # label; the model it points at can be refreshed here. Override per-run with --model.
@@ -68,6 +73,16 @@ COMMON_PROMPT = (
 )
 
 
+def validate_name(name: str, kind: str = "name") -> str:
+    """Reject anything that is not a plain single path segment (no separators, no '..')."""
+    if not isinstance(name, str) or not NAME_RE.match(name):
+        raise SystemExit(
+            f"ERROR: invalid {kind} {name!r} — use letters, digits, '.', '_', '-' only "
+            "(a single directory name, no path separators)"
+        )
+    return name
+
+
 def benchmark_root() -> Path:
     """Root directory that holds the per-task directories.
 
@@ -78,7 +93,7 @@ def benchmark_root() -> Path:
 
 def task_dir(task: str = DEFAULT_TASK) -> Path:
     """The directory holding a task's description, config, and candidate outputs."""
-    return benchmark_root() / task
+    return benchmark_root() / validate_name(task, "task")
 
 
 def load_task(task: str = DEFAULT_TASK) -> dict:

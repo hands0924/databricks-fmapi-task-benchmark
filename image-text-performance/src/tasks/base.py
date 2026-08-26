@@ -13,7 +13,14 @@ runner는 task_id로 플러그인을 동적 로드해 (모델 × reasoning_mode)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
+
+from src.scoring.judge import (
+    DEFAULT_JUDGE_ENDPOINT,
+    JudgeItem,
+    judge_batch,
+    resolve_rubric,
+)
 
 
 @dataclass
@@ -59,6 +66,63 @@ class Task:
     def score(self, parsed: list[Any], samples: list[Sample]) -> dict[str, Any]:
         """파싱 결과 전체를 집계해 메트릭 dict 반환. parsed[i]는 samples[i]에 대응."""
         raise NotImplementedError
+
+    # --- LLM-as-judge (생성/QA 태스크용 기본 구현) ---
+
+    judge_rubric_fallback: ClassVar[dict[str, Any]] = {}
+
+    def judge_question(self, sample: Sample) -> str:
+        """judge 프롬프트의 질문/문맥. 기본은 inputs["question"]."""
+        return str(sample.inputs.get("question", ""))
+
+    def judge_reference(self, sample: Sample) -> str:
+        """judge 프롬프트의 참고 정답. 정답이 리스트면 첫 번째를 사용."""
+        reference = sample.reference
+        if isinstance(reference, (list, tuple)):
+            return str(reference[0]) if reference else ""
+        return str(reference)
+
+    def judge_scores(
+        self,
+        parsed: list[Any],
+        samples: list[Sample],
+        judge_client: Any,
+        judge_endpoint: str = DEFAULT_JUDGE_ENDPOINT,
+    ) -> dict[str, Any]:
+        """LLM judge로 샘플별 1-5 점수와 평균을 계산.
+
+        루브릭은 config/judge_rubrics.yaml의 task_id 항목을 쓰고, 없으면
+        서브클래스의 judge_rubric_fallback을 사용한다. 호출/파싱 실패는 중간값 3.
+        서브클래스는 judge_question/judge_reference만 재정의하면 된다.
+        """
+        if not parsed or not samples:
+            return {"judge_scores": [], "judge_mean": 0.0, "n_judged": 0}
+
+        rubric = resolve_rubric(self.task_id, self.judge_rubric_fallback)
+        items = [
+            JudgeItem(
+                question=self.judge_question(sample),
+                reference=self.judge_reference(sample),
+                candidate=pred,
+                sample_id=sample.sample_id,
+            )
+            for pred, sample in zip(parsed, samples)
+        ]
+
+        scores = judge_batch(
+            judge_client,
+            items,
+            task_id=self.task_id,
+            rubric=rubric,
+            judge_endpoint=judge_endpoint,
+            extra_params={},
+        )
+
+        return {
+            "judge_scores": scores,
+            "judge_mean": sum(scores) / len(scores) if scores else 0.0,
+            "n_judged": len(scores),
+        }
 
 
 # 태스크 레지스트리: task_id → Task 서브클래스. 각 태스크 모듈이 import 시 register()로 등록.

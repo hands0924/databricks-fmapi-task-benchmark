@@ -15,13 +15,13 @@ Token-level F1과 정확도 매칭을 계산하며, LLM 판사(judge)를 통한 
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
-from src.adapters.fmapi import build_text_message, FMAPIClient
-from src.datasets_loader import load_hf_split, load_registry, resolve_dataset_entry
+from src.adapters.fmapi import FMAPIClient, build_text_message
+from src.datasets_loader import load_registry
 from src.scoring.metrics import token_f1, exact_match
-from src.scoring.judge import load_rubrics, build_judge_prompt, parse_judge_score
 from src.tasks.base import Task, Sample, register
+from src.tasks.common import best_reference_score, mean, single_language_rows
 
 
 @register
@@ -43,21 +43,14 @@ class Txt1Task(Task):
 
         텍스트 신호: 'words' 필드가 있으면 OCR 텍스트로 활용, 없으면 질문만으로 평가.
         """
-        registry = load_registry()
-        config = self.config
-
-        if "datasets" not in config or "en" not in config["datasets"]:
-            raise ValueError("config에 datasets.en (doc_vqa)가 없음")
-
-        dataset_key = config["datasets"]["en"]
-        dataset_entry = resolve_dataset_entry(registry, dataset_key)
-
-        hf_id = dataset_entry["hf_id"]
-        split = dataset_entry.get("split", "validation")
-        config_name = dataset_entry.get("config")
-
-        # HF 데이터셋 로드 (seed 고정)
-        hf_ds = load_hf_split(hf_id, split, n, seed, config_name)
+        dataset_key, hf_ds = single_language_rows(
+            self.config,
+            "en",
+            n,
+            seed,
+            default_split="validation",
+            dataset_hint="doc_vqa",
+        )
 
         samples = []
         for sample_id, row in enumerate(hf_ds):
@@ -160,119 +153,38 @@ Answer:"""
 
             # 여러 정답 중 최고 점수
             reference_list = sample.reference  # list[str]
-            max_f1 = 0.0
-            max_em = 0.0
-
-            for gold in reference_list:
-                # Token-F1 (영어 토크나이제이션)
-                f1 = token_f1(pred, gold, "en")
-                max_f1 = max(max_f1, f1)
-
-                # Exact match (정규화: strip + lowercase)
-                em = exact_match(pred, gold)
-                max_em = max(max_em, em)
-
-            token_f1_scores.append(max_f1)
-            exact_match_scores.append(max_em)
+            token_f1_scores.append(
+                best_reference_score(pred, reference_list, lambda p, g: token_f1(p, g, "en"))
+            )
+            exact_match_scores.append(best_reference_score(pred, reference_list, exact_match))
 
         return {
-            "token_f1": sum(token_f1_scores) / len(token_f1_scores) if token_f1_scores else 0.0,
-            "exact_match": sum(exact_match_scores) / len(exact_match_scores) if exact_match_scores else 0.0,
+            "token_f1": mean(token_f1_scores),
+            "exact_match": mean(exact_match_scores),
             "n_evaluated": len(parsed),
         }
 
-    def judge_scores(
-        self,
-        parsed: list[str],
-        samples: list[Sample],
-        judge_client: FMAPIClient,
-        judge_endpoint: str = "databricks-gemini-3-1-pro",
-    ) -> dict[str, Any]:
-        """LLM 판사를 사용한 정성적 평가.
+    # judge_scores는 Task 기본 구현 사용 (질문/루브릭만 태스크별로 지정)
+    judge_rubric_fallback: ClassVar[dict[str, Any]] = {
+        "name": "Document QA",
+        "description": "Extract accurate answers from document text",
+        "anchors": {
+            "1": "Answer is unrelated or completely incorrect",
+            "2": "Answer reflects only partial document content or core is distorted",
+            "3": "Answer accurately reflects most of document content but with minor errors or omissions",
+            "4": "Answer is nearly identical to reference with only minor phrasing differences",
+            "5": "Answer is identical or equivalent to reference with perfect accuracy",
+        },
+    }
 
-        각 샘플에 대해 판사 모델을 호출해 1-5 점수를 얻는다.
-        """
-        if not parsed or not samples:
-            return {
-                "judge_scores": [],
-                "judge_mean": 0.0,
-                "n_judged": 0,
-            }
+    def judge_question(self, sample: Sample) -> str:
+        """OCR 문맥이 있으면 문서 텍스트와 질문을 함께 제시."""
+        question = sample.inputs["question"]
+        context = sample.inputs.get("context", "")
 
-        # Rubric 로드
-        try:
-            rubrics = load_rubrics("config/judge_rubrics.yaml")
-        except FileNotFoundError:
-            rubrics = {}
-
-        # TXT-1용 rubric (없으면 generic QA 사용)
-        if "TXT-1" in rubrics:
-            rubric = rubrics["TXT-1"]
-        else:
-            # Fallback: generic QA rubric
-            rubric = {
-                "name": "Document QA",
-                "description": "Extract accurate answers from document text",
-                "anchors": {
-                    "1": "Answer is unrelated or completely incorrect",
-                    "2": "Answer reflects only partial document content or core is distorted",
-                    "3": "Answer accurately reflects most of document content but with minor errors or omissions",
-                    "4": "Answer is nearly identical to reference with only minor phrasing differences",
-                    "5": "Answer is identical or equivalent to reference with perfect accuracy",
-                }
-            }
-
-        judge_scores = []
-        for pred, sample in zip(parsed, samples):
-            question = sample.inputs["question"]
-            context = sample.inputs.get("context", "")
-            # reference_list 중 첫 번째를 참고정답으로 사용
-            reference = sample.reference[0] if sample.reference else ""
-
-            # Judge prompt 구성
-            if context:
-                judge_prompt = build_judge_prompt(
-                    task_id="TXT-1",
-                    question=f"Document text: {context}\n\nQuestion: {question}",
-                    reference=reference,
-                    candidate=pred,
-                    rubric=rubric,
-                )
-            else:
-                judge_prompt = build_judge_prompt(
-                    task_id="TXT-1",
-                    question=f"Question: {question}",
-                    reference=reference,
-                    candidate=pred,
-                    rubric=rubric,
-                )
-
-            try:
-                # Judge 호출
-                response = judge_client.chat(
-                    endpoint=judge_endpoint,
-                    messages=build_text_message(judge_prompt),
-                    max_tokens=256,
-                    extra_params={},
-                )
-
-                # 점수 파싱
-                score = parse_judge_score(response.text)
-                if score is not None:
-                    judge_scores.append(score)
-                else:
-                    judge_scores.append(3)  # 파싱 실패 시 중간값
-            except Exception as e:
-                print(f"Judge 호출 실패 (샘플 {sample.sample_id}): {e}")
-                judge_scores.append(3)  # 오류 시 중간값
-
-        mean_score = sum(judge_scores) / len(judge_scores) if judge_scores else 0.0
-
-        return {
-            "judge_scores": judge_scores,
-            "judge_mean": mean_score,
-            "n_judged": len(judge_scores),
-        }
+        if context:
+            return f"Document text: {context}\n\nQuestion: {question}"
+        return f"Question: {question}"
 
 
 if __name__ == "__main__":

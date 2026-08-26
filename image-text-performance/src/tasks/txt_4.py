@@ -7,14 +7,14 @@ Token-level F1과 exact match를 계산하며, LLM judge를 통한 정성적 평
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
-from src.adapters.fmapi import build_text_message, FMAPIClient
-from src.datasets_loader import load_hf_split, load_registry, resolve_dataset_entry
-from src.scoring.metrics import token_f1
+from src.adapters.fmapi import FMAPIClient, build_text_message
+from src.datasets_loader import load_registry
+from src.scoring.metrics import exact_match, token_f1
 from src.scoring.tokenizers import korean_tokenizer_backend
-from src.scoring.judge import load_rubrics, build_judge_prompt, parse_judge_score
 from src.tasks.base import Task, Sample, register
+from src.tasks.common import best_reference_score, mean, single_language_rows
 
 
 @register
@@ -33,23 +33,9 @@ class Txt4Task(Task):
         - question: 질문
         - answers: {'text': [답변들], 'answer_start': [위치들]} (여러 정답 가능)
         """
-        registry = load_registry()
-        config = self.config
-
-        if "datasets" not in config or "ko" not in config["datasets"]:
-            raise ValueError("config에 datasets.ko (korquad)가 없음")
-
-        dataset_key = config["datasets"]["ko"]
-        dataset_entry = resolve_dataset_entry(registry, dataset_key)
-
-        hf_id = dataset_entry["hf_id"]
-        # 주의: registry.yaml에서 split="train"이지만, 실제 평가는 validation 권장
-        # 여기서는 명시적으로 validation 사용 (테스트용)
-        split = dataset_entry.get("split", "train")
-        config_name = dataset_entry.get("config")
-
-        # HF 데이터셋 로드 (seed 고정)
-        hf_ds = load_hf_split(hf_id, split, n, seed, config_name)
+        dataset_key, hf_ds = single_language_rows(
+            self.config, "ko", n, seed, dataset_hint="korquad"
+        )
 
         samples = []
         for sample_id, row in enumerate(hf_ds):
@@ -126,114 +112,34 @@ class Txt4Task(Task):
 
             # 여러 정답 중 최고 점수
             reference_list = sample.reference  # list[str]
-            max_f1 = 0.0
-            max_em = 0.0
-
-            for gold in reference_list:
-                # Token-F1 (언어=ko로 명시)
-                f1 = token_f1(pred, gold, "ko")
-                max_f1 = max(max_f1, f1)
-
-                # Exact match (정규화: strip + lowercase)
-                pred_norm = pred.strip().lower()
-                gold_norm = gold.strip().lower()
-                em = 1.0 if pred_norm == gold_norm else 0.0
-                max_em = max(max_em, em)
-
-            token_f1_scores.append(max_f1)
-            exact_match_scores.append(max_em)
+            token_f1_scores.append(
+                best_reference_score(pred, reference_list, lambda p, g: token_f1(p, g, "ko"))
+            )
+            exact_match_scores.append(best_reference_score(pred, reference_list, exact_match))
 
         return {
-            "token_f1": sum(token_f1_scores) / len(token_f1_scores) if token_f1_scores else 0.0,
-            "exact_match": sum(exact_match_scores) / len(exact_match_scores) if exact_match_scores else 0.0,
+            "token_f1": mean(token_f1_scores),
+            "exact_match": mean(exact_match_scores),
             "n_evaluated": len(parsed),
             "korean_backend": korean_tokenizer_backend(),
         }
 
-    def judge_scores(
-        self,
-        parsed: list[str],
-        samples: list[Sample],
-        judge_client: FMAPIClient,
-        judge_endpoint: str = "databricks-gemini-3-1-pro",
-    ) -> dict[str, Any]:
-        """LLM judge를 사용한 정성적 평가.
+    # judge_scores는 Task 기본 구현 사용 (질문/루브릭만 태스크별로 지정)
+    judge_rubric_fallback: ClassVar[dict[str, Any]] = {
+        "name": "한국어 독해 QA",
+        "description": "주어진 지문에서 정확한 정답을 추출하는 능력 평가",
+        "anchors": {
+            "1": "답변이 지문과 무관하거나 완전히 잘못됨",
+            "2": "답변이 지문의 일부만 반영하거나 핵심이 왜곡됨",
+            "3": "답변이 대부분 정확하나 미세한 오류나 누락 있음",
+            "4": "답변이 정답과 거의 동일하고 미세한 표현 차이만 있음",
+            "5": "답변이 정답과 동일하거나 동등 수준의 정확성으로 전달",
+        },
+    }
 
-        각 샘플에 대해 judge 모델을 호출해 1-5 점수를 얻는다.
-        judge_rubrics.yaml에 TXT-4 rubric이 없으면 generic QA rubric을 사용.
-        """
-        if not parsed or not samples:
-            return {
-                "judge_scores": [],
-                "judge_mean": 0.0,
-                "n_judged": 0,
-            }
-
-        # Rubric 로드
-        try:
-            rubrics = load_rubrics("config/judge_rubrics.yaml")
-        except FileNotFoundError:
-            rubrics = {}
-
-        # TXT-4용 rubric (없으면 generic QA 사용)
-        if "TXT-4" in rubrics:
-            rubric = rubrics["TXT-4"]
-        else:
-            # Fallback: generic QA rubric
-            rubric = {
-                "name": "한국어 독해 QA",
-                "description": "주어진 지문에서 정확한 정답을 추출하는 능력 평가",
-                "anchors": {
-                    "1": "답변이 지문과 무관하거나 완전히 잘못됨",
-                    "2": "답변이 지문의 일부만 반영하거나 핵심이 왜곡됨",
-                    "3": "답변이 대부분 정확하나 미세한 오류나 누락 있음",
-                    "4": "답변이 정답과 거의 동일하고 미세한 표현 차이만 있음",
-                    "5": "답변이 정답과 동일하거나 동등 수준의 정확성으로 전달",
-                }
-            }
-
-        judge_scores = []
-        for pred, sample in zip(parsed, samples):
-            context = sample.inputs["context"]
-            question = sample.inputs["question"]
-            # reference_list 중 첫 번째를 참고정답으로 사용
-            reference = sample.reference[0] if sample.reference else ""
-
-            # Judge prompt 구성
-            judge_prompt = build_judge_prompt(
-                task_id="TXT-4",
-                question=f"지문: {context}\n\n질문: {question}",
-                reference=reference,
-                candidate=pred,
-                rubric=rubric,
-            )
-
-            try:
-                # Judge 호출
-                response = judge_client.chat(
-                    endpoint=judge_endpoint,
-                    messages=build_text_message(judge_prompt),
-                    max_tokens=256,
-                    extra_params={},
-                )
-
-                # 점수 파싱
-                score = parse_judge_score(response.text)
-                if score is not None:
-                    judge_scores.append(score)
-                else:
-                    judge_scores.append(3)  # 파싱 실패 시 중간값
-            except Exception as e:
-                print(f"Judge 호출 실패 (샘플 {sample.sample_id}): {e}")
-                judge_scores.append(3)  # 오류 시 중간값
-
-        mean_score = sum(judge_scores) / len(judge_scores) if judge_scores else 0.0
-
-        return {
-            "judge_scores": judge_scores,
-            "judge_mean": mean_score,
-            "n_judged": len(judge_scores),
-        }
+    def judge_question(self, sample: Sample) -> str:
+        """지문과 질문을 함께 제시."""
+        return f"지문: {sample.inputs['context']}\n\n질문: {sample.inputs['question']}"
 
 
 if __name__ == "__main__":

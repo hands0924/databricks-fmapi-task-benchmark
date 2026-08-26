@@ -3,8 +3,8 @@
 import httpx
 import pytest
 
-from src.adapters import fmapi
 from src import runner
+from src.adapters import fmapi
 from src.report import generate
 from src.scoring import stats
 from src.tasks import img_4, txt_1, txt_3

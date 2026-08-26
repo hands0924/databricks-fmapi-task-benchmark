@@ -251,7 +251,7 @@ def run_direct_fmapi(task, candidate, harness, model, workdir, max_seconds) -> d
             meta["note"] = ("completion hit max_tokens (finish_reason=length) — "
                             "slides.html may be truncated")
             print(f"[run_task] WARNING: {meta['note']}")
-    except Exception as e:  # noqa: BLE001 — record any failure, never crash the run
+    except Exception as e:  # record any failure without crashing the run
         meta["note"] = f"FMAPI call failed ({type(e).__name__}: {e})"
         print(f"[run_task] ERROR: {meta['note']}")
     finally:
@@ -325,7 +325,12 @@ def run_manual(task, candidate, harness, model, workdir) -> dict:
             subprocess.run(["pbcopy"], input=task_spec.COMMON_PROMPT, text=True,
                            check=True, timeout=10)
             clipboard = True
-        except Exception:
+        except (OSError, subprocess.SubprocessError) as e:
+            print(
+                f"[run_task] WARNING: clipboard copy failed "
+                f"({type(e).__name__}: {e})",
+                file=sys.stderr,
+            )
             clipboard = False
 
     print("\n" + "=" * 72)
@@ -395,7 +400,7 @@ def run_manual(task, candidate, harness, model, workdir) -> dict:
     return meta
 
 
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser(
         description="Run one candidate of a benchmark task (produces <task>/<candidate>/slides.html).")
     ap.add_argument("--task", default=task_spec.DEFAULT_TASK,
@@ -470,7 +475,20 @@ def main() -> None:
             meta["effective_model"] = f"{args.pi_provider}/{args.model}"
 
     write_meta(workdir, meta)
+    failures = []
+    if not meta["artifact_exists"]:
+        failures.append("slides.html missing or empty")
+    if meta["timed_out"]:
+        failures.append("timed out")
+    if meta["exit_code"] not in (0, None):
+        failures.append(f"exit code {meta['exit_code']}")
+    if meta.get("aborted"):
+        failures.append("run aborted")
+    if failures:
+        print(f"[run_task] FAILED: {'; '.join(failures)}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

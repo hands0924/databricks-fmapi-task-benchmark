@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import importlib
 import pkgutil
+import sys
 
 from src.tasks import base
+
+
+IMPORT_ERRORS: dict[str, str] = {}
 
 
 def discover_tasks() -> dict[str, type[base.Task]]:
@@ -21,6 +25,7 @@ def discover_tasks() -> dict[str, type[base.Task]]:
     """
     import src.tasks as tasks_pkg
 
+    IMPORT_ERRORS.clear()
     skip = {"base", "loader"}
     for mod_info in pkgutil.iter_modules(tasks_pkg.__path__):
         name = mod_info.name
@@ -28,6 +33,8 @@ def discover_tasks() -> dict[str, type[base.Task]]:
             continue
         try:
             importlib.import_module(f"src.tasks.{name}")
-        except Exception as e:  # 미구현·의존성 오류는 스킵 (점진 구현 허용)
-            print(f"  [태스크 로드 스킵] {name}: {type(e).__name__}: {e}")
+        except Exception as e:  # skip modules with varied import failures
+            error = f"{type(e).__name__}: {e}"
+            IMPORT_ERRORS[name] = error
+            print(f"  [태스크 로드 스킵] {name}: {error}", file=sys.stderr)
     return base.all_registered()

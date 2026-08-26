@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import re
 import random
+import sys
 from typing import Any
 
 from src.adapters.fmapi import FMAPIClient, build_image_message
 from src.adapters.images import pil_to_data_url
-from src.datasets_loader import load_hf_split, load_registry, resolve_dataset_entry
+from src.datasets_loader import load_hf_split, load_registry
 from src.scoring.metrics import binary_metrics
 from src.tasks.base import Task, Sample, register
 
@@ -41,13 +42,15 @@ class Img4Task(Task):
 
         캐시에서만 로드 (D3). 이미지는 메모리 전용, 저장 금지.
         """
-        registry = load_registry()
+        load_registry()
         n_pos = n // 2  # NSFW 샘플 수
         n_neg = n - n_pos  # SFW 샘플 수
 
         # 1) NSFW 샘플 로드
         print("[IMG-4] Loading %d NSFW samples from DarkyMan/nsfw-image-classification..." % n_pos)
         nsfw_samples = []
+        errors = []
+        first_error: Exception | None = None
         try:
             nsfw_ds = load_hf_split(
                 "DarkyMan/nsfw-image-classification",
@@ -73,8 +76,14 @@ class Img4Task(Task):
                     "source": "nsfw",
                     "source_idx": idx
                 })
-        except Exception as e:
-            print("[IMG-4] Warning: Failed to load NSFW samples: %s" % e)
+        except Exception as e:  # report source-specific loading failures
+            first_error = e
+            errors.append(f"NSFW {type(e).__name__}: {e}")
+            print(
+                "[IMG-4] Warning: Failed to load NSFW samples: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
 
         # 2) SFW 샘플 로드 (COCO)
         print("[IMG-4] Loading %d SFW samples from detection-datasets/coco..." % n_neg)
@@ -99,11 +108,27 @@ class Img4Task(Task):
                     "source": "coco",
                     "source_idx": idx
                 })
-        except Exception as e:
-            print("[IMG-4] Warning: Failed to load SFW samples: %s" % e)
+        except Exception as e:  # report source-specific loading failures
+            if first_error is None:
+                first_error = e
+            errors.append(f"SFW {type(e).__name__}: {e}")
+            print(
+                "[IMG-4] Warning: Failed to load SFW samples: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
 
         # 3) 샘플 결합 및 셔플
         all_samples_dict = nsfw_samples + sfw_samples
+        if not nsfw_samples or not sfw_samples:
+            error_detail = "; ".join(errors) if errors else "no source error captured"
+            message = (
+                f"IMG-4 requires both NSFW and SFW samples; "
+                f"nsfw={len(nsfw_samples)} sfw={len(sfw_samples)}; errors: {error_detail}"
+            )
+            if first_error is not None:
+                raise RuntimeError(message) from first_error
+            raise RuntimeError(message)
         rng = random.Random(seed)
         rng.shuffle(all_samples_dict)
 

@@ -9,7 +9,7 @@ Key function:
   comparing two sets of scores, typically across multiple samples.
 """
 
-from typing import Optional
+import sys
 
 from scipy import stats
 
@@ -43,6 +43,7 @@ def wilcoxon_test(
                 too few samples).
         - significant: boolean, True if pval < 0.05, False otherwise.
         - n: int, number of samples (pairs).
+        - error: exception type and message if scipy fails, otherwise None.
     """
     if len(scores_a) != len(scores_b):
         raise ValueError("scores_a and scores_b must have the same length")
@@ -54,6 +55,7 @@ def wilcoxon_test(
             "pval": None,
             "significant": False,
             "n": n,
+            "error": None,
         }
 
     # Compute differences
@@ -69,17 +71,22 @@ def wilcoxon_test(
             "pval": None,
             "significant": False,
             "n": n,
+            "error": None,
         }
 
     # Compute Wilcoxon signed-rank test
     try:
-        stat, pval = stats.wilcoxon(diffs)
-    except Exception:
-        # If the test fails (e.g., all values identical), return None
+        _stat, pval = stats.wilcoxon(diffs)
+    except ValueError as e:
+        print(
+            f"Wilcoxon test failed ({type(e).__name__}: {e})",
+            file=sys.stderr,
+        )
         return {
             "pval": None,
             "significant": False,
             "n": n,
+            "error": f"{type(e).__name__}: {e}",
         }
 
     # Check significance at α=0.05
@@ -89,4 +96,5 @@ def wilcoxon_test(
         "pval": float(pval),
         "significant": bool(significant),
         "n": int(n),
+        "error": None,
     }

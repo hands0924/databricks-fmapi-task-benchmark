@@ -196,7 +196,7 @@ def main() -> int:
 
     # 재현성 메타(§12): 데이터셋 id·split, pricing 버전, 샘플·seed 스냅샷
     defaults = tasks_cfg.get("defaults", {})
-    datasets_snapshot, pricing_snapshot = _reproducibility_meta(all_tasks)
+    datasets_snapshot, pricing_snapshot, meta_errors = _reproducibility_meta(all_tasks)
 
     manifest = RunManifest(
         run_id=run_id,
@@ -209,6 +209,7 @@ def main() -> int:
         pricing=pricing_snapshot,
         samples_per_task=args.samples or defaults.get("samples", 50),
         seed=defaults.get("seed", 42),
+        meta_errors=meta_errors,
         notes="dry-run" if args.dry_run else "full run",
     )
 
@@ -284,17 +285,32 @@ def _run_samples(
     - 태스크 플러그인을 동적 로드. 미구현 태스크는 스킵(점진 구현 허용).
     - 샘플은 태스크당 1회 로드해 (모델×모드)가 동일 subset을 공유(공정 비교·재현성).
     - 각 호출의 request_id 기록 → 나중에 ai_gateway.usage와 조인(비용·시간).
+
+    결과·점수는 항상 저장하되, 결과를 신뢰할 수 없게 만드는 실패
+    (태스크 import·샘플 로드·채점·리포트 실패, 전체 호출 실패)는
+    errors.json에 남기고 exit code 1로 전파한다.
     """
     from datetime import datetime, timezone
 
     from src.datasets_loader import load_registry
     from src.results import SampleResult, write_sample_results
     from src.tasks.base import Sample
-    from src.tasks.loader import discover_tasks
+    from src.tasks.loader import IMPORT_ERRORS, discover_tasks
 
     registry = load_registry()
     task_classes = discover_tasks()
     print(f"로드된 태스크: {sorted(task_classes)}")
+
+    errors: dict[str, Any] = {
+        "task_import_errors": dict(IMPORT_ERRORS),
+        "sample_load_errors": {},
+        "parse_errors": 0,
+        "api_errors": 0,
+        "score_errors": {},
+        "unregistered_tasks": [],
+    }
+    if IMPORT_ERRORS:
+        print(f"경고: 태스크 import 실패: {IMPORT_ERRORS}", file=sys.stderr)
 
     defaults = tasks_cfg.get("defaults", {})
     n_samples = sample_cap or defaults.get("samples", 50)
@@ -311,13 +327,16 @@ def _run_samples(
             return task_cache[task_id]
         cls = task_classes.get(task_id)
         if cls is None:
+            errors["unregistered_tasks"].append(task_id)
+            print(f"경고: 등록된 플러그인이 없는 태스크: {task_id}", file=sys.stderr)
             task_cache[task_id] = (None, [])
             return task_cache[task_id]
         inst = cls(all_task_cfgs.get(task_id, {}), registry)
         try:
             samples = inst.load_samples(n_samples, seed)
         except Exception as e:
-            print(f"  [샘플 로드 실패] {task_id}: {type(e).__name__}: {e}")
+            errors["sample_load_errors"][task_id] = f"{type(e).__name__}: {e}"
+            print(f"  [샘플 로드 실패] {task_id}: {type(e).__name__}: {e}", file=sys.stderr)
             samples = []
         task_cache[task_id] = (inst, samples)
         return task_cache[task_id]
@@ -356,12 +375,25 @@ def _run_samples(
                 latency_ms = (time.perf_counter() - t0) * 1000
                 output_text = f"__ERROR__: {type(e).__name__}: {e}"
                 req_id, finish, usage = None, "error", {}
+                errors["api_errors"] += 1
+                print(
+                    f"  [호출 실패] {model.id}/{task_id}/{mode} 샘플 {s.sample_id}: "
+                    f"{type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
 
-            # 채점용 파싱 (실패해도 실행은 계속)
+            # 채점용 파싱 (실패해도 실행은 계속하되 사유를 결과에 남긴다)
+            parse_error = None
             try:
                 parsed = inst.parse_output(output_text, s)
-            except Exception:
+            except Exception as e:
                 parsed = None
+                parse_error = f"{type(e).__name__}: {e}"
+                errors["parse_errors"] += 1
+                print(
+                    f"  [파싱 실패] {model.id}/{task_id}/{mode} 샘플 {s.sample_id}: {parse_error}",
+                    file=sys.stderr,
+                )
             groups[gkey]["parsed"].append(parsed)
             groups[gkey]["samples"].append(s)
             groups[gkey]["outputs"].append(output_text)
@@ -380,12 +412,14 @@ def _run_samples(
                     usage=usage,
                     latency_ms_local=latency_ms,
                     timestamp=datetime.now(timezone.utc).isoformat(),
+                    parse_error=parse_error,
                 )
             )
             executed += 1
 
     # 그룹별 채점 집계
-    scores = _score_groups(groups, task_cache)
+    scores, score_errors = _score_groups(groups, task_cache)
+    errors["score_errors"] = score_errors
 
     path = write_sample_results(run_dir, results)
     _write_json(run_dir / "scores.json", scores)
@@ -399,22 +433,68 @@ def _run_samples(
         report_path = generate_report(run_dir, results, scores, models_cfg)
         print(f"리포트 생성: {report_path}")
     except Exception as e:
-        print(f"  [리포트 생성 스킵] {type(e).__name__}: {e}")
+        errors["report_error"] = f"{type(e).__name__}: {e}"
+        print(f"  [리포트 생성 실패] {errors['report_error']}", file=sys.stderr)
 
-    # 전체 run 인덱스 재빌드 (§12 시점별 축적)
+    # 전체 run 인덱스 재빌드 (§12 시점별 축적) — 보조 산출물이라 실패해도 run은 유효
     try:
         from src.report.index import rebuild_index
 
         idx = rebuild_index()
         print(f"인덱스 갱신: {idx}")
     except Exception as e:
-        print(f"  [인덱스 갱신 스킵] {type(e).__name__}: {e}")
+        errors["index_error"] = f"{type(e).__name__}: {e}"
+        print(f"  [인덱스 갱신 스킵] {errors['index_error']}", file=sys.stderr)
 
+    fatal = _fatal_reasons(errors, executed)
+    errors["executed"] = executed
+    errors["fatal"] = fatal
+    _write_json(run_dir / "errors.json", errors)
+
+    if errors["api_errors"] or errors["parse_errors"]:
+        print(
+            f"호출 실패 {errors['api_errors']}건, 파싱 실패 {errors['parse_errors']}건 "
+            f"(상세: {run_dir / 'errors.json'})",
+            file=sys.stderr,
+        )
+    if fatal:
+        for reason in fatal:
+            print(f"실패: {reason}", file=sys.stderr)
+        return 1
     return 0
 
 
-def _reproducibility_meta(all_tasks: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """manifest용 데이터셋·pricing 스냅샷 (§12 재현성). 로드 실패해도 빈 dict."""
+def _fatal_reasons(errors: dict[str, Any], executed: int) -> list[str]:
+    """결과를 신뢰할 수 없게 만드는 실패만 골라 사유 목록으로 돌려준다.
+
+    인덱스 재빌드·개별 호출 실패는 치명적이지 않다(리포트에 건수로 드러남).
+    """
+    reasons = []
+    if errors["task_import_errors"]:
+        reasons.append(f"태스크 import 실패: {sorted(errors['task_import_errors'])}")
+    if errors["sample_load_errors"]:
+        reasons.append(f"샘플 로드 실패: {sorted(errors['sample_load_errors'])}")
+    if errors["score_errors"]:
+        reasons.append(f"채점 실패: {sorted(errors['score_errors'])}")
+    if errors.get("report_error"):
+        reasons.append(f"리포트 생성 실패: {errors['report_error']}")
+    if executed == 0:
+        reasons.append("실행된 샘플 호출이 없음")
+    elif errors["api_errors"] == executed:
+        reasons.append(f"모든 호출이 실패({executed}건)")
+    return reasons
+
+
+def _reproducibility_meta(
+    all_tasks: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    """manifest용 데이터셋·pricing 스냅샷 (§12 재현성).
+
+    수집에 실패하면 빈 dict를 돌려주되, 실패 사유를 함께 반환해 manifest에 남긴다
+    (스냅샷이 비어 있는 manifest를 완전한 것처럼 보이지 않게 한다).
+    """
+    errors: dict[str, str] = {}
+
     datasets_snapshot: dict[str, Any] = {}
     try:
         from src.datasets_loader import load_registry
@@ -428,8 +508,9 @@ def _reproducibility_meta(all_tasks: list[dict[str, Any]]) -> tuple[dict[str, An
                     "split": entry.get("split"),
                     "config": entry.get("config"),
                 }
-    except Exception:
-        pass
+    except Exception as e:
+        errors["datasets"] = f"{type(e).__name__}: {e}"
+        print(f"warning: dataset snapshot unavailable: {errors['datasets']}", file=sys.stderr)
 
     pricing_snapshot: dict[str, Any] = {}
     try:
@@ -437,35 +518,42 @@ def _reproducibility_meta(all_tasks: list[dict[str, Any]]) -> tuple[dict[str, An
 
         p = load_pricing()
         pricing_snapshot = {"usd_per_dbu": p.get("usd_per_dbu"), "routing": p.get("routing")}
-    except Exception:
-        pass
+    except Exception as e:
+        errors["pricing"] = f"{type(e).__name__}: {e}"
+        print(f"warning: pricing snapshot unavailable: {errors['pricing']}", file=sys.stderr)
 
-    return datasets_snapshot, pricing_snapshot
+    return datasets_snapshot, pricing_snapshot, errors
 
 
-def _score_groups(groups: dict, task_cache: dict) -> dict[str, Any]:
+def _score_groups(groups: dict, task_cache: dict) -> tuple[dict[str, Any], dict[str, str]]:
     """(model, task, mode) 그룹별로 태스크 score()를 호출해 집계.
 
     태스크마다 score() 반환 형식이 달라도 그대로 저장(리포트가 흡수).
     키는 "model_id::task_id::mode" 문자열.
+
+    Returns: (집계 dict, 그룹키 → 채점 실패 사유)
     """
     out: dict[str, Any] = {}
+    score_errors: dict[str, str] = {}
     for (model_id, task_id, mode), g in groups.items():
         inst = task_cache.get(task_id, (None, []))[0]
         if inst is None:
             continue
+        key = f"{model_id}::{task_id}::{mode}"
         try:
             metrics = inst.score(g["parsed"], g["samples"])
         except Exception as e:
             metrics = {"error": f"{type(e).__name__}: {e}"}
-        out[f"{model_id}::{task_id}::{mode}"] = {
+            score_errors[key] = metrics["error"]
+            print(f"  [채점 실패] {key}: {metrics['error']}", file=sys.stderr)
+        out[key] = {
             "model_id": model_id,
             "task_id": task_id,
             "reasoning_mode": mode,
             "n": len(g["samples"]),
             "metrics": metrics,
         }
-    return out
+    return out, score_errors
 
 
 def _write_json(path: Path, obj: Any) -> None:

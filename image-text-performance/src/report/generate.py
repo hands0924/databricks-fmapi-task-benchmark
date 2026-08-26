@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import statistics
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -67,7 +68,11 @@ def _perf_by_model(results: list[SampleResult], endpoints: dict[str, str]) -> di
     pricing = load_pricing()
     agg: dict[str, dict] = {}
     for r in results:
-        a = agg.setdefault(r.model_id, {"latencies": [], "usd": 0.0, "in_tok": 0, "out_tok": 0, "n": 0, "errors": 0})
+        a = agg.setdefault(
+            r.model_id,
+            {"latencies": [], "usd": 0.0, "in_tok": 0, "out_tok": 0, "n": 0, "errors": 0,
+             "priced": 0, "unpriced": 0},
+        )
         a["n"] += 1
         if r.finish_reason == "error":
             a["errors"] += 1
@@ -75,7 +80,17 @@ def _perf_by_model(results: list[SampleResult], endpoints: dict[str, str]) -> di
         a["latencies"].append(r.latency_ms_local)
         ep = endpoints.get(r.model_id, "")
         usd = compute_usd(ep, r.usage or {}, pricing)
-        if usd:
+        if usd is None:
+            # unpriced endpoint: treating it as $0 would make the model look cheapest
+            if a["unpriced"] == 0:
+                print(
+                    f"warning: endpoint '{ep}' missing from pricing table; "
+                    f"cost for {r.model_id} is incomplete",
+                    file=sys.stderr,
+                )
+            a["unpriced"] += 1
+        else:
+            a["priced"] += 1
             a["usd"] += usd
         a["in_tok"] += (r.usage or {}).get("prompt_tokens", 0) or 0
         a["out_tok"] += (r.usage or {}).get("completion_tokens", 0) or 0
@@ -88,7 +103,9 @@ def _perf_by_model(results: list[SampleResult], endpoints: dict[str, str]) -> di
             "errors": a["errors"],
             "latency_ms_median": round(statistics.median(lat), 1) if lat else None,
             "latency_ms_p95": round(_p95(lat), 1) if lat else None,
-            "total_usd": round(a["usd"], 6),
+            "total_usd": round(a["usd"], 6) if a["priced"] else None,
+            "unpriced_calls": a["unpriced"],
+            "usd_complete": a["unpriced"] == 0,
             "in_tokens": a["in_tok"],
             "out_tokens": a["out_tok"],
         }
@@ -130,7 +147,10 @@ def _extract_facts(scores: dict[str, Any], perf: dict[str, dict]) -> dict[str, A
         win_counts[w] = win_counts.get(w, 0) + 1
 
     # 비용·속도 최고/최저
-    cheapest = min(perf, key=lambda k: perf[k]["total_usd"]) if perf else None
+    # models with unpriced calls are excluded: their total is an undercount
+    priced = [k for k in perf if perf[k]["usd_complete"] and perf[k]["total_usd"] is not None]
+    unpriced_models = sorted(k for k in perf if not perf[k]["usd_complete"])
+    cheapest = min(priced, key=lambda k: perf[k]["total_usd"]) if priced else None
     fastest = min(
         (k for k in perf if perf[k]["latency_ms_median"] is not None),
         key=lambda k: perf[k]["latency_ms_median"],
@@ -141,6 +161,7 @@ def _extract_facts(scores: dict[str, Any], perf: dict[str, dict]) -> dict[str, A
         "task_winners": winners,
         "win_counts": win_counts,
         "cheapest_model": cheapest,
+        "unpriced_models": unpriced_models,
         "fastest_model": fastest,
         "perf": perf,
     }
@@ -163,10 +184,17 @@ def _executive_summary(facts: dict[str, Any], models_cfg) -> str:
         with FMAPIClient(profile=models_cfg.profile, timeout_seconds=max(60, models_cfg.runtime.timeout_seconds)) as c:
             resp = c.chat(models_cfg.judge, build_text_message(prompt), max_tokens=3000)
         if resp.text.strip():
+            facts["executive_summary_source"] = "judge"
             return resp.text.strip() + f"\n\n<sub>규칙 기반 요약(대조용): {rule_based}</sub>"
-    except Exception:
-        pass
-    return rule_based
+        reason = "judge returned an empty summary"
+    except Exception as e:
+        reason = f"{type(e).__name__}: {e}"
+    print(
+        f"warning: judge summary unavailable, falling back to rule-based summary: {reason}",
+        file=sys.stderr,
+    )
+    facts["executive_summary_source"] = f"rule_based (judge failed: {reason})"
+    return rule_based + f"\n\n<sub>judge summary unavailable ({reason}) — rule-based summary shown.</sub>"
 
 
 def _rule_based_summary(facts: dict[str, Any]) -> str:
@@ -182,6 +210,11 @@ def _rule_based_summary(facts: dict[str, Any]) -> str:
     if facts.get("cheapest_model"):
         ch = facts["cheapest_model"]
         parts.append(f"비용은 **{ch}**가 가장 낮다(${facts['perf'][ch]['total_usd']}).")
+    if facts.get("unpriced_models"):
+        parts.append(
+            f"단, {', '.join(facts['unpriced_models'])}는 pricing 표에 없는 endpoint 호출이 있어 "
+            "비용 비교에서 제외했다."
+        )
     return " ".join(parts) if parts else "집계할 결과가 없습니다."
 
 
@@ -199,12 +232,21 @@ def _quant_table(scores: dict[str, Any]) -> str:
     return "\n".join(rows)
 
 
+def _usd_cell(p: dict) -> str:
+    """비용 셀: pricing 표에 없는 endpoint가 있으면 불완전함을 표시(0으로 오해 금지)."""
+    if p["total_usd"] is None:
+        return f"N/A (pricing 없음, {p['unpriced_calls']}건)"
+    if not p["usd_complete"]:
+        return f"{p['total_usd']} (불완전, pricing 없는 호출 {p['unpriced_calls']}건)"
+    return str(p["total_usd"])
+
+
 def _perf_table(perf: dict[str, dict]) -> str:
     rows = ["| 모델 | 호출 | 오류 | latency median(ms) | p95(ms) | 입력토큰 | 출력토큰 | 비용(USD) |",
             "|---|---|---|---|---|---|---|---|"]
     for mid, p in sorted(perf.items()):
         rows.append(
             f"| {mid} | {p['n_calls']} | {p['errors']} | {p['latency_ms_median']} | "
-            f"{p['latency_ms_p95']} | {p['in_tokens']} | {p['out_tokens']} | {p['total_usd']} |"
+            f"{p['latency_ms_p95']} | {p['in_tokens']} | {p['out_tokens']} | {_usd_cell(p)} |"
         )
     return "\n".join(rows)

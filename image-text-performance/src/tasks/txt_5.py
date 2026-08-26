@@ -11,6 +11,7 @@ ROUGE 메트릭은 언어별로 적절한 토크나이제이션을 적용한다:
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 from src.adapters.fmapi import FMAPIClient, build_text_message
@@ -281,16 +282,21 @@ Summary:"""
 
         Returns:
             dict with keys:
-            - judge_score_mean: 평균 점수 (1-5)
-            - judge_scores: 샘플별 점수 리스트
-            - n_evaluated: 평가된 샘플 수
+            - judge_score_mean: 유효 점수 평균 (1-5). 유효 점수가 없으면 None
+            - judge_scores: 샘플별 점수 리스트 (호출·파싱 실패는 None)
+            - n_evaluated: 유효 점수를 얻은 샘플 수
+            - n_requested: 판사 호출을 시도한 샘플 수
+            - n_unparsed: 응답에서 점수를 파싱하지 못한 샘플 수
+            - judge_errors: 판사 호출 오류 목록
             - per_language: 언어별 평균 점수
         """
         rubrics = load_rubrics()
         rubric = rubrics.get("TXT-5", {})
 
-        scores = []
-        scores_per_lang = {"en": [], "ko": []}
+        scores: list[int | None] = []
+        scores_per_lang: dict[str, list[int]] = {"en": [], "ko": []}
+        judge_errors: list[str] = []
+        n_unparsed = 0
 
         for pred, sample in zip(parsed, samples):
             document = sample.inputs["document"]
@@ -308,16 +314,31 @@ Summary:"""
 
             # 판사 모델 호출
             messages = build_text_message(judge_prompt)
-            judge_response = judge_client.chat(
-                endpoint=judge_endpoint,
-                messages=messages,
-                max_tokens=256,
-            )
+            try:
+                judge_response = judge_client.chat(
+                    endpoint=judge_endpoint,
+                    messages=messages,
+                    max_tokens=256,
+                )
+            except Exception as e:
+                judge_errors.append(f"sample {sample.sample_id}: {type(e).__name__}: {e}")
+                print(
+                    f"judge call failed (sample {sample.sample_id}): {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+                scores.append(None)
+                continue
 
             # 스코어 파싱
             judge_score = parse_judge_score(judge_response.text)
             if judge_score is None:
-                judge_score = 3  # 파싱 실패 시 중간값
+                n_unparsed += 1
+                print(
+                    f"judge score unparsable (sample {sample.sample_id})",
+                    file=sys.stderr,
+                )
+                scores.append(None)
+                continue
 
             scores.append(judge_score)
             scores_per_lang[lang].append(judge_score)
@@ -335,12 +356,16 @@ Summary:"""
                 per_language[lang] = {"mean": None, "n": 0}
 
         # 전체 평균
-        mean_score = sum(scores) / len(scores) if scores else 3.0
+        valid = [s for s in scores if s is not None]
+        mean_score = sum(valid) / len(valid) if valid else None
 
         return {
             "judge_score_mean": mean_score,
             "judge_scores": scores,
-            "n_evaluated": len(scores),
+            "n_evaluated": len(valid),
+            "n_requested": len(scores),
+            "n_unparsed": n_unparsed,
+            "judge_errors": judge_errors,
             "per_language": per_language,
         }
 
@@ -454,7 +479,8 @@ if __name__ == "__main__":
             )
 
             print(f"\nJudge Metrics (1-5 scale):")
-            print(f"  Mean judge score: {judge_results['judge_score_mean']:.2f}")
+            jm = judge_results["judge_score_mean"]
+            print(f"  Mean judge score: {jm:.2f}" if jm is not None else "  Mean judge score: N/A")
             print(f"  Samples evaluated: {judge_results['n_evaluated']}")
 
             print(f"\nPer-language judge scores:")

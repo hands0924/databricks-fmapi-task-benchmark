@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,7 @@ class SampleResult:
     usage: dict[str, Any]              # {prompt_tokens, completion_tokens, ...}
     latency_ms_local: float            # 클라이언트 측 벽시계 시간(ms)
     timestamp: str                     # ISO 8601 timestamp
+    parse_error: str | None = None     # parse_output() failure ("Type: msg"), None if it parsed
 
 
 def make_run_id(version_suffix: str = "") -> str:
@@ -50,7 +52,7 @@ def make_run_id(version_suffix: str = "") -> str:
 def git_commit() -> str | None:
     """현재 커밋 SHA를 얻는다 (short form).
 
-    git이 없거나 repo가 아니면 None 반환.
+    git이 없거나 repo가 아니면 None 반환 (경고를 stderr로 남긴다).
     """
     try:
         result = subprocess.run(
@@ -59,11 +61,17 @@ def git_commit() -> str | None:
             text=True,
             timeout=5,
         )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return None
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"warning: git commit unavailable: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        print(
+            f"warning: git commit unavailable (exit {result.returncode}): "
+            f"{result.stderr.strip()[:200]}",
+            file=sys.stderr,
+        )
+        return None
+    return result.stdout.strip()
 
 
 @dataclass
@@ -80,6 +88,7 @@ class RunManifest:
     pricing: dict[str, Any] = field(default_factory=dict)    # usd_per_dbu 등 (비용 재현 §12)
     samples_per_task: int | None = None                       # 태스크당 샘플 수
     seed: int | None = None                                   # subset 고정 seed
+    meta_errors: dict[str, str] = field(default_factory=dict)  # 스냅샷 수집 실패 사유 (재현성 감사)
     notes: str = ""                    # 추가 메모 (선택)
 
     def to_dict(self) -> dict[str, Any]:

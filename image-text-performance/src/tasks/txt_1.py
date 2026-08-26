@@ -15,6 +15,7 @@ Token-level F1과 정확도 매칭을 계산하며, LLM 판사(judge)를 통한 
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 from src.adapters.fmapi import build_text_message, FMAPIClient
@@ -195,8 +196,11 @@ Answer:"""
         if not parsed or not samples:
             return {
                 "judge_scores": [],
-                "judge_mean": 0.0,
+                "judge_mean": None,
                 "n_judged": 0,
+                "n_requested": 0,
+                "n_unparsed": 0,
+                "judge_errors": [],
             }
 
         # Rubric 로드
@@ -222,7 +226,9 @@ Answer:"""
                 }
             }
 
-        judge_scores = []
+        judge_scores: list[int | None] = []
+        judge_errors: list[str] = []
+        n_unparsed = 0
         for pred, sample in zip(parsed, samples):
             question = sample.inputs["question"]
             context = sample.inputs.get("context", "")
@@ -258,20 +264,29 @@ Answer:"""
 
                 # 점수 파싱
                 score = parse_judge_score(response.text)
-                if score is not None:
-                    judge_scores.append(score)
-                else:
-                    judge_scores.append(3)  # 파싱 실패 시 중간값
+                if score is None:
+                    n_unparsed += 1
+                    print(f"Judge 점수 파싱 실패 (샘플 {sample.sample_id})", file=sys.stderr)
+                judge_scores.append(score)
             except Exception as e:
-                print(f"Judge 호출 실패 (샘플 {sample.sample_id}): {e}")
-                judge_scores.append(3)  # 오류 시 중간값
+                judge_errors.append(f"sample {sample.sample_id}: {type(e).__name__}: {e}")
+                print(
+                    f"Judge 호출 실패 (샘플 {sample.sample_id}): {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+                judge_scores.append(None)
 
-        mean_score = sum(judge_scores) / len(judge_scores) if judge_scores else 0.0
+        # 판사 호출·파싱 실패는 점수로 대체하지 않고 제외 (평균 왜곡 방지)
+        valid = [s for s in judge_scores if s is not None]
+        mean_score = sum(valid) / len(valid) if valid else None
 
         return {
             "judge_scores": judge_scores,
             "judge_mean": mean_score,
-            "n_judged": len(judge_scores),
+            "n_judged": len(valid),
+            "n_requested": len(judge_scores),
+            "n_unparsed": n_unparsed,
+            "judge_errors": judge_errors,
         }
 
 
@@ -370,7 +385,8 @@ if __name__ == "__main__":
 
                     print(f"\n=== Judge 점수 (1-5) ===")
                     print(f"개별 점수: {judge_result['judge_scores']}")
-                    print(f"평균 점수: {judge_result['judge_mean']:.2f}")
+                    mean = judge_result["judge_mean"]
+                    print(f"평균 점수: {mean:.2f}" if mean is not None else "평균 점수: N/A")
                     print(f"평가 샘플 수: {judge_result['n_judged']}")
             except Exception as e:
                 print(f"Judge 호출 실패: {e}")
